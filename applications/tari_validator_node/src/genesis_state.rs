@@ -12,6 +12,7 @@ use tari_engine_types::{
     vault::Vault,
 };
 use tari_ootle_app_utilities::{
+    genesis_governance::GenesisCouncil,
     genesis_resources::{get_public_identity_resource, get_stealth_tari_resource},
     shared_consts::TXTR_FAUCET_INITIAL_SUPPLY,
 };
@@ -41,6 +42,7 @@ use tari_template_lib::types::{
     SubstateOwnerRule,
     access_rules::{ComponentAccessRules, LOCKED, ResourceAccessRules},
     constants::{
+        BURN_RATE_GOVERNANCE_COMPONENT_ADDRESS,
         NFT_FAUCET_COMPONENT_ADDRESS,
         NFT_FAUCET_RESOURCE_ADDRESS,
         PUBLIC_IDENTITY_RESOURCE_ADDRESS,
@@ -50,6 +52,7 @@ use tari_template_lib::types::{
         XTR_FAUCET_COMPONENT_ADDRESS,
         XTR_FAUCET_VAULT_ADDRESS,
     },
+    governance::BurnRateGovernanceState,
     rule,
 };
 
@@ -69,6 +72,7 @@ pub fn create_genesis_state<TTx>(
     tx: &mut TTx,
     network: Network,
     num_preshards: NumPreshards,
+    genesis_council: &GenesisCouncil,
 ) -> Result<(), StorageError>
 where
     TTx: StateStoreWriteTransaction + Deref,
@@ -87,6 +91,8 @@ where
     let (xtr_address, xtr_resource) = get_stealth_tari_resource(network);
     substates.push((xtr_address.into(), xtr_resource.into()));
 
+    substates.push(burn_rate_governance_substate(genesis_council));
+
     if network.is_testnet() {
         // Create tXTR faucet
         substates.extend(xtr_faucet_substates());
@@ -97,6 +103,32 @@ where
     commit_genesis_substates(tx, network, num_preshards, substates)?;
 
     Ok(())
+}
+
+/// The component the council moves the exhaust burn rate through.
+///
+/// Instantiated on every network, with an empty schedule and whatever council the node seats. The
+/// address has to exist from genesis: it lives on the global shard, and state roots are taken over
+/// that shard from the first block. A network that seats no council gets one owned by nobody, which
+/// leaves the rate with the release-scheduled table.
+///
+/// The council is the owner rule and every method rule denies, so the engine admits a call only from
+/// the owner. `ComponentAccessRules::new()` denies by default, which is the whole of the method
+/// policy.
+fn burn_rate_governance_substate(council: &GenesisCouncil) -> (SubstateId, SubstateValue) {
+    let component = Component {
+        header: ComponentHeader {
+            template_address: tari_template_builtin::BURN_RATE_GOVERNANCE_TEMPLATE_ADDRESS,
+            owner_rule: council.owner_rule(),
+            access_rules: ComponentAccessRules::new(),
+            entity_id: EntityId::default(),
+        },
+        body: ComponentBody::from_cbor_value(
+            tari_bor::to_value(&BurnRateGovernanceState::new()).expect("BurnRateGovernanceState encode is infallible"),
+        ),
+    };
+
+    (BURN_RATE_GOVERNANCE_COMPONENT_ADDRESS.into(), component.into())
 }
 
 fn xtr_faucet_substates() -> Vec<(SubstateId, SubstateValue)> {

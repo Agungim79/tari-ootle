@@ -1248,16 +1248,11 @@ impl<'tx, TAddr: NodeAddressable + Serialize + DeserializeOwned + 'tx, R: RocksR
         I: IntoIterator<Item = &'a (Epoch, PcId)>,
         I::IntoIter: ExactSizeIterator,
     {
-        const OPERATION: &str = "proposal_certificates_get_all";
-        let iter = qc_ids.into_iter();
-        let expected = iter.len();
-        let qcs = self.db().cf(ProposalCertificateCf)?.multi_get(iter, OPERATION)?;
-        if qcs.len() != expected {
-            return Err(StorageError::NotFound {
-                item: "QuorumCertificate",
-                key: "one or more qc_ids".to_string(),
-            });
-        }
+        const OPERATION: &str = "proposal_certificates_get_many";
+        let qcs = self
+            .db()
+            .cf(ProposalCertificateCf)?
+            .multi_get_exact(qc_ids, OPERATION)?;
         Ok(qcs)
     }
 
@@ -1273,15 +1268,7 @@ impl<'tx, TAddr: NodeAddressable + Serialize + DeserializeOwned + 'tx, R: RocksR
         I::IntoIter: ExactSizeIterator,
     {
         const OPERATION: &str = "timeout_certificates_get_many";
-        let iter = ids.into_iter();
-        let expected = iter.len();
-        let tcs = self.db().cf(TimeoutCertificateCf)?.multi_get(iter, OPERATION)?;
-        if tcs.len() != expected {
-            return Err(StorageError::NotFound {
-                item: "TimeoutCertificate",
-                key: "one or more tc_ids".to_string(),
-            });
-        }
+        let tcs = self.db().cf(TimeoutCertificateCf)?.multi_get_exact(ids, OPERATION)?;
         Ok(tcs)
     }
 
@@ -1811,12 +1798,11 @@ impl<'tx, TAddr: NodeAddressable + Serialize + DeserializeOwned + 'tx, R: RocksR
 
         // TODO(perf): we still have to load all substates for the id and version regardless of the value filters - not
         // ideal
-        let substates = substate_cf.multi_get(data.transitions.iter().map(|t| t.substate_address), OPERATION)?;
+        let substates = substate_cf.multi_get_exact(data.transitions.iter().map(|t| t.substate_address), OPERATION)?;
 
         let mut updates = Vec::with_capacity(data.transitions.len());
         let all_hashes = value_filter.include_filtered_hashes();
         let up_only = value_filter.is_up_only();
-        // multi_get returns the substates in the same order as queried, so ordered by transitions
         for (rec, substate) in data.transitions.iter().zip(substates) {
             let update = match rec.transition {
                 StateTransitionType::Up => {

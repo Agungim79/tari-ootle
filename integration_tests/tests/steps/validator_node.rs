@@ -473,27 +473,25 @@ async fn vn_is_past_burn_proof_epoch(world: &mut TariWorld, step: &Step, vn_name
     let Some(CucumberClaimProof::Confirmed { complete_proof, .. }) = world.claim_proofs.get(&proof_name) else {
         panic!("Burn proof {proof_name} is not a confirmed proof");
     };
-    let mined_in_epoch = Epoch(
-        complete_proof
-            .mined_in_epoch
-            .unwrap_or_else(|| panic!("Burn proof {proof_name} does not record the epoch it was mined in")),
-    );
+    let mined_in_epoch = Epoch(complete_proof.mined_in_epoch);
     let vn = world.get_validator_node(&vn_name);
     let mut client = vn.create_client();
     let mut current_epoch = Epoch(0);
     for _ in 0..TIMEOUT_SECS {
+        // A claim executes in the consensus epoch, which trails the epoch manager's until the epoch's last block
+        // commits
         current_epoch = client
-            .get_epoch_manager_stats()
+            .get_consensus_status()
             .await
-            .expect("Failed to get stats")
-            .current_epoch;
+            .expect("Failed to get consensus status")
+            .epoch;
         if current_epoch > mined_in_epoch {
             return;
         }
         tokio::time::sleep(Duration::from_secs(1)).await;
     }
     panic!(
-        "Validator {vn_name} is on epoch {current_epoch}, not past epoch {mined_in_epoch} that burn proof \
+        "Validator {vn_name} consensus is in epoch {current_epoch}, not past epoch {mined_in_epoch} that burn proof \
          {proof_name} was mined in, after {TIMEOUT_SECS}s"
     );
 }

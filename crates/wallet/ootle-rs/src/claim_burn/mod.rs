@@ -153,16 +153,25 @@ impl<'a, P: WalletProvider<Wallet = OotleWallet>> ClaimBurn<'a, P> {
 
         // `R`, the public nonce the L1 UTXO was burnt with.
         let sender_offset_public_key: RistrettoPublicKey = claim_proof
+            .output
             .sender_offset_public_key
             .try_from_byte_type()
             .map_err(|e| StealthProviderError::UnexpectedError {
                 details: format!("Invalid sender_offset_public_key in burn proof: {e}"),
             })?;
 
-        // `s = H(p·R) + p`. The L1 ownership proof commits the burn to `s·G`, so this is the only key
-        // that can satisfy the spend condition on the minted burn UTXO. It seals the claim transaction.
+        // `s = H(p·R) + p`. The burn output names `S = s·G` as its claim key, and the engine only accepts a claim
+        // that `S` signs, so the claim key seals the claim transaction.
         let stealth_secret = wallet.derive_burn_claim_secret(&sender_offset_public_key).await?;
         let stealth_claim_pk = RistrettoPublicKey::from_secret_key(&stealth_secret).to_byte_type();
+        let claim_public_key = claim_proof.output.features.claim_public_key;
+        if stealth_claim_pk != claim_public_key {
+            return Err(StealthProviderError::BurnClaimNotForThisWallet {
+                claim_public_key,
+                wallet_claim_public_key: stealth_claim_pk,
+            }
+            .into());
+        }
 
         if !StealthCryptoApi::new().validate_burn_claim_ownership_proof(
             network,

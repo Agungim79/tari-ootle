@@ -34,10 +34,11 @@ use crate::{
         BlockIdCodec,
         DefaultCodec,
         KeyPrefix,
+        NodeHeightCodec,
+        NumberCodec,
         SubstateIdCodec,
         SubstateLockKeyCodec,
         TransactionIdCodec,
-        UnitCodec,
     },
     column_families::cf_names,
     prefixed,
@@ -78,20 +79,38 @@ impl Cf for SubstateLockModel {
     }
 }
 
-prefixed!(SubstateLockHeadIndexPrefix, KeyPrefix::SubstateLockHeadIndex);
+prefixed!(SubstateLockChainOrderPrefix, KeyPrefix::SubstateLockChainOrderIndex);
 
-pub struct HeadIndex;
+/// Orders a substate's locks the way a chain grants them: by block height, then by the order the block granted them.
+///
+/// `grant_seq` is a lock's position in the sequence its block granted for the substate. A chain holds one block per
+/// height, so `(block_height, grant_seq)` totally orders every lock a chain holds on the substate, and a descending
+/// scan filtered to one chain's blocks yields its most recently granted lock first.
+///
+/// `block_id` is what makes the key unique: sibling blocks at one height each number their grants from zero, so without
+/// it the second block written would overwrite the first block's entries for the substate. Its position between the two
+/// ordering components also keeps one block's entries contiguous.
+pub struct ChainOrderIndex;
 
-impl Cf for HeadIndex {
-    type Key = SubstateId;
-    type KeyCodec = SubstateIdCodec;
-    type Prefix = SubstateLockHeadIndexPrefix;
-    type Value = SubstateLockKey;
-    type ValueCodec = SubstateLockKeyCodec<(TransactionId, SubstateId, BlockId, NodeHeight)>;
+impl Cf for ChainOrderIndex {
+    type Key = (SubstateId, NodeHeight, BlockId, u32);
+    type KeyCodec = (SubstateIdCodec, NodeHeightCodec, BlockIdCodec, NumberCodec<u32>);
+    type Prefix = SubstateLockChainOrderPrefix;
+    type Value = TransactionId;
+    type ValueCodec = TransactionIdCodec;
 
     fn name() -> &'static str {
         cf_names::SUBSTATES
     }
+}
+
+/// Every lock held on a substate, most recently granted first when scanned descending.
+pub struct ByChainOrderQuery;
+
+impl QueryCf for ByChainOrderQuery {
+    type Cf = ChainOrderIndex;
+    type Key = SubstateId;
+    type KeyCodec = SubstateIdCodec;
 }
 
 pub struct ByTransactionIdQuery;
@@ -106,12 +125,14 @@ prefixed!(SubstatesBlockIdIndexPrefix, KeyPrefix::SubstateLocksBlockIdIndex);
 
 pub struct BlockIdIndex;
 
+/// The value is the lock's `grant_seq`, which completes its [`ChainOrderIndex`] key. Holding it here lets a lock be
+/// removed from that index by exact key, since every path that removes a lock reaches it by block or by transaction.
 impl Cf for BlockIdIndex {
     type Key = SubstateLockKey;
     type KeyCodec = SubstateLockKeyCodec<(BlockId, SubstateId, TransactionId, NodeHeight)>;
     type Prefix = SubstatesBlockIdIndexPrefix;
-    type Value = ();
-    type ValueCodec = UnitCodec;
+    type Value = u32;
+    type ValueCodec = NumberCodec<u32>;
 
     fn name() -> &'static str {
         cf_names::SUBSTATES
@@ -124,15 +145,6 @@ impl QueryCf for ByBlockIdQuery {
     type Cf = BlockIdIndex;
     type Key = BlockId;
     type KeyCodec = BlockIdCodec;
-}
-
-#[derive(Default)]
-pub struct ByBlockIdSubstateIdQuery;
-
-impl QueryCf for ByBlockIdSubstateIdQuery {
-    type Cf = BlockIdIndex;
-    type Key = (BlockId, SubstateId);
-    type KeyCodec = (BlockIdCodec, SubstateIdCodec);
 }
 
 prefixed!(SubstateIdIndexPrefix, KeyPrefix::SubstateLockSubstateIdIndex);

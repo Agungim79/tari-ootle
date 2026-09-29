@@ -18,9 +18,11 @@ use tari_ootle_transaction::TransactionId;
 
 use crate::helpers::{
     commit_chain,
+    create_block_with_qc,
     create_chain,
     create_random_substate_id,
     create_rocksdb,
+    substate_id_seed,
     substate_id_tx_seed,
     transaction_id_from_seed,
 };
@@ -127,4 +129,289 @@ fn gen_locks(transaction_id: TransactionId, num: usize) -> impl Iterator<Item = 
         let lock = SubstateLock::new(transaction_id, SubstateVersion::new(i), SubstateLockType::Write, false);
         (id, lock)
     })
+}
+
+/// A block grants several locks on one substate in command order, and the chain's answer is the last of them.
+///
+/// The lock granted first also sorts first by transaction id, so the last-granted lock is not the one key order reaches
+/// first and the assertion can tell the two apart. The sibling branch is written between the two reads: the answer
+/// belongs to b9's chain, so neither read may move it.
+#[test]
+fn the_latest_lock_does_not_depend_on_other_branches() {
+    let (db, _tmp) = create_rocksdb();
+    let mut tx = db.create_write_tx().unwrap();
+
+    let chain = create_chain(10);
+    commit_chain(&mut tx, &chain);
+    let b8 = chain[8].as_leaf();
+    let b9 = chain[9].as_leaf();
+
+    let substate_id = create_random_substate_id();
+    let (granted_first, granted_last) = ordered_transaction_ids();
+
+    tx.substate_locks_insert_all(&b8, &two_locks(&substate_id, granted_first, granted_last))
+        .unwrap();
+
+    let lock = tx.substate_locks_get_latest_for_substate(&b9, &substate_id).unwrap();
+    assert_eq!(lock.transaction_id(), &granted_last);
+    assert_eq!(lock.lock_type(), SubstateLockType::Output);
+
+    // A sibling of b9 locks the same substate. It is not on b9's chain, so b9's answer must not move.
+    let fork = create_block_with_qc(&b8);
+    tx.proposal_certificates_save(fork.justify()).unwrap();
+    fork.insert(&mut tx).unwrap();
+    let fork_locks = IndexMap::from([(substate_id.clone(), vec![SubstateLock::new(
+        transaction_id_from_seed(9),
+        SubstateVersion::new(1),
+        SubstateLockType::Output,
+        true,
+    )])]);
+    tx.substate_locks_insert_all(&fork.as_leaf(), &fork_locks).unwrap();
+
+    let lock = tx.substate_locks_get_latest_for_substate(&b9, &substate_id).unwrap();
+    assert_eq!(
+        lock.transaction_id(),
+        &granted_last,
+        "writing a sibling branch changed the answer for b9"
+    );
+    assert_eq!(lock.lock_type(), SubstateLockType::Output);
+
+    tx.rollback().unwrap();
+}
+
+/// A lock a committed block granted is ordered the same way as a pending one, so the answer is still the last granted.
+#[test]
+fn the_latest_committed_lock_is_the_one_granted_last() {
+    let (db, _tmp) = create_rocksdb();
+    let mut tx = db.create_write_tx().unwrap();
+
+    let chain = create_chain(10);
+    commit_chain(&mut tx, &chain);
+    // commit_chain commits every block below the last three, so this block is beneath the commit block and no longer in
+    // the pending chain.
+    let committed = chain[6].as_leaf();
+    let b9 = chain[9].as_leaf();
+
+    let substate_id = create_random_substate_id();
+    let (granted_first, granted_last) = ordered_transaction_ids();
+
+    tx.substate_locks_insert_all(&committed, &two_locks(&substate_id, granted_first, granted_last))
+        .unwrap();
+
+    let lock = tx.substate_locks_get_latest_for_substate(&b9, &substate_id).unwrap();
+    assert_eq!(lock.transaction_id(), &granted_last);
+    assert_eq!(lock.lock_type(), SubstateLockType::Output);
+
+    tx.rollback().unwrap();
+}
+
+/// A branch the leaf does not extend holds no locks as far as that leaf is concerned.
+#[test]
+fn a_lock_from_another_branch_is_not_found() {
+    let (db, _tmp) = create_rocksdb();
+    let mut tx = db.create_write_tx().unwrap();
+
+    let chain = create_chain(10);
+    commit_chain(&mut tx, &chain);
+    let b8 = chain[8].as_leaf();
+    let b9 = chain[9].as_leaf();
+
+    let fork = create_block_with_qc(&b8);
+    tx.proposal_certificates_save(fork.justify()).unwrap();
+    fork.insert(&mut tx).unwrap();
+
+    let substate_id = create_random_substate_id();
+    let locks = IndexMap::from([(substate_id.clone(), vec![SubstateLock::new(
+        transaction_id_from_seed(1),
+        SubstateVersion::new(0),
+        SubstateLockType::Write,
+        false,
+    )])]);
+    tx.substate_locks_insert_all(&fork.as_leaf(), &locks).unwrap();
+
+    let lock = tx
+        .substate_locks_get_latest_for_substate(&b9, &substate_id)
+        .optional()
+        .unwrap();
+    assert!(lock.is_none());
+
+    // The branch that granted it sees it
+    let lock = tx
+        .substate_locks_get_latest_for_substate(&fork.as_leaf(), &substate_id)
+        .unwrap();
+    assert_eq!(lock.transaction_id(), &transaction_id_from_seed(1));
+
+    tx.rollback().unwrap();
+}
+
+/// Releasing one transaction's lock must leave the other locks on the substate reachable.
+#[test]
+fn releasing_one_transactions_lock_leaves_the_rest() {
+    let (db, _tmp) = create_rocksdb();
+    let mut tx = db.create_write_tx().unwrap();
+
+    let chain = create_chain(10);
+    commit_chain(&mut tx, &chain);
+    let b8 = chain[8].as_leaf();
+    let b9 = chain[9].as_leaf();
+
+    let substate_id = create_random_substate_id();
+    let (granted_first, granted_last) = ordered_transaction_ids();
+
+    tx.substate_locks_insert_all(&b8, &two_locks(&substate_id, granted_first, granted_last))
+        .unwrap();
+
+    tx.substate_locks_remove_many_for_transactions(Some(&granted_last))
+        .unwrap();
+
+    let lock = tx.substate_locks_get_latest_for_substate(&b9, &substate_id).unwrap();
+    assert_eq!(lock.transaction_id(), &granted_first);
+    assert_eq!(lock.lock_type(), SubstateLockType::Read);
+
+    tx.substate_locks_remove_many_for_transactions(Some(&granted_first))
+        .unwrap();
+
+    let lock = tx
+        .substate_locks_get_latest_for_substate(&b9, &substate_id)
+        .optional()
+        .unwrap();
+    assert!(lock.is_none());
+
+    tx.rollback().unwrap();
+}
+
+/// Removing a block releases every lock it granted, including the ones the chain-order index holds.
+#[test]
+fn removing_a_block_releases_every_lock_it_granted() {
+    let (db, _tmp) = create_rocksdb();
+    let mut tx = db.create_write_tx().unwrap();
+
+    let chain = create_chain(10);
+    commit_chain(&mut tx, &chain);
+    let b8 = chain[8].as_leaf();
+    let b9 = chain[9].as_leaf();
+
+    let substate_id = create_random_substate_id();
+    let (granted_first, granted_last) = ordered_transaction_ids();
+
+    tx.substate_locks_insert_all(&b8, &two_locks(&substate_id, granted_first, granted_last))
+        .unwrap();
+    tx.substate_locks_remove_any_by_block_id(b8.block_id()).unwrap();
+
+    let lock = tx
+        .substate_locks_get_latest_for_substate(&b9, &substate_id)
+        .optional()
+        .unwrap();
+    assert!(lock.is_none());
+
+    tx.rollback().unwrap();
+}
+
+/// Two transaction ids, the lower first. Granting in this order makes transaction-id order agree with grant order, so
+/// the last-granted lock is the last in key order rather than the first.
+fn ordered_transaction_ids() -> (TransactionId, TransactionId) {
+    let mut ids = [transaction_id_from_seed(1), transaction_id_from_seed(2)];
+    ids.sort();
+    (ids[0], ids[1])
+}
+
+/// A READ lock followed by an OUTPUT lock on one substate, as local-only rules allow within one block.
+fn two_locks(
+    substate_id: &SubstateId,
+    granted_first: TransactionId,
+    granted_last: TransactionId,
+) -> IndexMap<SubstateId, Vec<SubstateLock>> {
+    IndexMap::from([(substate_id.clone(), vec![
+        SubstateLock::new(granted_first, SubstateVersion::new(0), SubstateLockType::Read, true),
+        SubstateLock::new(granted_last, SubstateVersion::new(1), SubstateLockType::Output, true),
+    ])])
+}
+
+/// A branch block below the commit height holds no locks for the chain that committed that height.
+///
+/// Height alone does not place a lock on the committed chain: a branch block can sit below the commit block. It is
+/// still in the pending chain, which is what tells the two apart.
+#[test]
+fn a_lock_from_a_branch_below_the_commit_height_is_not_found() {
+    let (db, _tmp) = create_rocksdb();
+    let mut tx = db.create_write_tx().unwrap();
+
+    let chain = create_chain(10);
+    commit_chain(&mut tx, &chain);
+    let b9 = chain[9].as_leaf();
+
+    // A sibling of chain[6], so it sits below the commit block that commit_chain leaves at chain[7]
+    let branch = create_block_with_qc(&chain[5].as_leaf());
+    tx.proposal_certificates_save(branch.justify()).unwrap();
+    branch.insert(&mut tx).unwrap();
+    assert!(branch.height() < chain[7].height());
+
+    let substate_id = create_random_substate_id();
+    let locks = IndexMap::from([(substate_id.clone(), vec![SubstateLock::new(
+        transaction_id_from_seed(1),
+        SubstateVersion::new(0),
+        SubstateLockType::Write,
+        false,
+    )])]);
+    tx.substate_locks_insert_all(&branch.as_leaf(), &locks).unwrap();
+
+    let lock = tx
+        .substate_locks_get_latest_for_substate(&b9, &substate_id)
+        .optional()
+        .unwrap();
+    assert!(lock.is_none());
+
+    tx.rollback().unwrap();
+}
+
+/// Releasing locks must clear every index entry, over a loop long enough to matter.
+///
+/// Each release path rebuilds a lock's chain-order key from a `grant_seq` it reads back, so it can address the wrong
+/// entry and leave one behind. A record whose index entry outlives it is caught here because the lookup raises
+/// `DataInconsistency` rather than reporting the substate as unlocked.
+#[test]
+fn releasing_many_locks_leaves_none_behind() {
+    let (db, _tmp) = create_rocksdb();
+
+    for by_block in [true, false] {
+        let mut tx = db.create_write_tx().unwrap();
+        let chain = create_chain(10);
+        commit_chain(&mut tx, &chain);
+        let b8 = chain[8].as_leaf();
+        let b9 = chain[9].as_leaf();
+
+        let (granted_first, granted_last) = ordered_transaction_ids();
+        let substate_ids = (0..50).map(substate_id_seed).collect::<Vec<_>>();
+
+        let mut locks = IndexMap::new();
+        for id in &substate_ids {
+            locks.insert(id.clone(), vec![
+                SubstateLock::new(granted_first, SubstateVersion::new(0), SubstateLockType::Read, true),
+                SubstateLock::new(granted_last, SubstateVersion::new(1), SubstateLockType::Output, true),
+            ]);
+        }
+        tx.substate_locks_insert_all(&b8, &locks).unwrap();
+
+        for id in &substate_ids {
+            assert!(tx.substate_locks_get_latest_for_substate(&b9, id).is_ok());
+        }
+
+        if by_block {
+            tx.substate_locks_remove_any_by_block_id(b8.block_id()).unwrap();
+        } else {
+            tx.substate_locks_remove_many_for_transactions([&granted_first, &granted_last])
+                .unwrap();
+        }
+
+        for id in &substate_ids {
+            let lock = tx.substate_locks_get_latest_for_substate(&b9, id).optional().unwrap();
+            assert!(lock.is_none(), "lock left behind for {id} (by_block={by_block})");
+        }
+        for tx_id in [&granted_first, &granted_last] {
+            let locked = tx.substate_locks_get_locked_substates_for_transaction(tx_id).unwrap();
+            assert!(locked.is_empty(), "{tx_id} still holds locks (by_block={by_block})");
+        }
+
+        tx.rollback().unwrap();
+    }
 }

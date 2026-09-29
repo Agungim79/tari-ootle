@@ -53,16 +53,32 @@ impl<T> SubstateLockKeyCodec<T> {
         Ok((NodeHeight(u64::from_be_bytes(height)), 8))
     }
 
+    fn decode_grant_seq(&self, bytes: &[u8]) -> Result<(u32, usize), RocksDbStorageError> {
+        let grant_seq: [u8; 4] = take_fixed(bytes).ok_or_else(|| RocksDbStorageError::DecodeError {
+            source: anyhow!("SubstateLockKeyCodec: Invalid bytes for grant_seq"),
+        })?;
+        Ok((u32::from_be_bytes(grant_seq), 4))
+    }
+
+    fn encode_grant_seq<W: Write>(&self, value: &SubstateLockKey, writer: &mut W) -> Result<(), RocksDbStorageError> {
+        writer
+            .write_all(&value.grant_seq.to_be_bytes())
+            .map_err(|e| RocksDbStorageError::EncodeError {
+                source: anyhow!("SubstateLockKeyCodec: Failed to write grant_seq: {}", e),
+            })
+    }
+
     fn get_encoded_len(&self, value: &SubstateLockKey) -> Result<usize, RocksDbStorageError> {
         let len = BlockId::byte_size() + // block_id
             self.substate_id_codec.encode_len(&value.substate_id)? + // substate_id
             TransactionId::byte_size() + // transaction_id
-            8; // block_height
+            8 + // block_height
+            4; // grant_seq
         Ok(len)
     }
 }
 
-impl DbEncoder<SubstateLockKey> for SubstateLockKeyCodec<(TransactionId, SubstateId, BlockId, NodeHeight)> {
+impl DbEncoder<SubstateLockKey> for SubstateLockKeyCodec<(TransactionId, SubstateId, BlockId, NodeHeight, u32)> {
     fn encode_len(&self, value: &SubstateLockKey) -> Result<usize, RocksDbStorageError> {
         self.get_encoded_len(value)
     }
@@ -84,11 +100,12 @@ impl DbEncoder<SubstateLockKey> for SubstateLockKeyCodec<(TransactionId, Substat
             .map_err(|e| RocksDbStorageError::EncodeError {
                 source: anyhow!("SubstateLockKeyCodec: Failed to write block_height: {}", e),
             })?;
+        self.encode_grant_seq(value, writer)?;
         Ok(())
     }
 }
 
-impl DbDecoder<SubstateLockKey> for SubstateLockKeyCodec<(TransactionId, SubstateId, BlockId, NodeHeight)> {
+impl DbDecoder<SubstateLockKey> for SubstateLockKeyCodec<(TransactionId, SubstateId, BlockId, NodeHeight, u32)> {
     fn decode(&self, bytes: &[u8]) -> Result<(SubstateLockKey, usize), RocksDbStorageError> {
         let mut offset = 0;
         let (transaction_id, n) = self.decode_transaction_id(&bytes[offset..])?;
@@ -99,19 +116,22 @@ impl DbDecoder<SubstateLockKey> for SubstateLockKeyCodec<(TransactionId, Substat
         offset += n;
         let (block_height, n) = self.decode_block_height(&bytes[offset..])?;
         offset += n;
+        let (grant_seq, n) = self.decode_grant_seq(&bytes[offset..])?;
+        offset += n;
         Ok((
             SubstateLockKey {
                 block_id,
                 substate_id,
                 transaction_id,
                 block_height,
+                grant_seq,
             },
             offset,
         ))
     }
 }
 
-impl DbEncoder<SubstateLockKey> for SubstateLockKeyCodec<(BlockId, SubstateId, TransactionId, NodeHeight)> {
+impl DbEncoder<SubstateLockKey> for SubstateLockKeyCodec<(BlockId, SubstateId, TransactionId, NodeHeight, u32)> {
     fn encode_len(&self, value: &SubstateLockKey) -> Result<usize, RocksDbStorageError> {
         self.get_encoded_len(value)
     }
@@ -133,11 +153,12 @@ impl DbEncoder<SubstateLockKey> for SubstateLockKeyCodec<(BlockId, SubstateId, T
             .map_err(|e| RocksDbStorageError::EncodeError {
                 source: anyhow!("SubstateLockKeyCodec: Failed to write block_height: {}", e),
             })?;
+        self.encode_grant_seq(value, writer)?;
         Ok(())
     }
 }
 
-impl DbDecoder<SubstateLockKey> for SubstateLockKeyCodec<(BlockId, SubstateId, TransactionId, NodeHeight)> {
+impl DbDecoder<SubstateLockKey> for SubstateLockKeyCodec<(BlockId, SubstateId, TransactionId, NodeHeight, u32)> {
     fn decode(&self, bytes: &[u8]) -> Result<(SubstateLockKey, usize), RocksDbStorageError> {
         let mut offset = 0;
         let (block_id, n) = self.decode_block_id(&bytes[offset..])?;
@@ -148,6 +169,8 @@ impl DbDecoder<SubstateLockKey> for SubstateLockKeyCodec<(BlockId, SubstateId, T
         offset += n;
         let (block_height, n) = self.decode_block_height(&bytes[offset..])?;
         offset += n;
+        let (grant_seq, n) = self.decode_grant_seq(&bytes[offset..])?;
+        offset += n;
 
         Ok((
             SubstateLockKey {
@@ -155,13 +178,14 @@ impl DbDecoder<SubstateLockKey> for SubstateLockKeyCodec<(BlockId, SubstateId, T
                 substate_id,
                 transaction_id,
                 block_height,
+                grant_seq,
             },
             offset,
         ))
     }
 }
 
-impl DbEncoder<SubstateLockKey> for SubstateLockKeyCodec<(SubstateId, TransactionId, BlockId, NodeHeight)> {
+impl DbEncoder<SubstateLockKey> for SubstateLockKeyCodec<(SubstateId, TransactionId, BlockId, NodeHeight, u32)> {
     fn encode_len(&self, value: &SubstateLockKey) -> Result<usize, RocksDbStorageError> {
         self.get_encoded_len(value)
     }
@@ -187,11 +211,12 @@ impl DbEncoder<SubstateLockKey> for SubstateLockKeyCodec<(SubstateId, Transactio
             .map_err(|e| RocksDbStorageError::EncodeError {
                 source: anyhow!("SubstateLockKeyCodec: Failed to write block_height: {}", e),
             })?;
+        self.encode_grant_seq(value, writer)?;
         Ok(())
     }
 }
 
-impl DbDecoder<SubstateLockKey> for SubstateLockKeyCodec<(SubstateId, TransactionId, BlockId, NodeHeight)> {
+impl DbDecoder<SubstateLockKey> for SubstateLockKeyCodec<(SubstateId, TransactionId, BlockId, NodeHeight, u32)> {
     fn decode(&self, bytes: &[u8]) -> Result<(SubstateLockKey, usize), RocksDbStorageError> {
         let mut offset = 0;
         let (substate_id, n) = self.decode_substate_id(&bytes[offset..])?;
@@ -202,6 +227,8 @@ impl DbDecoder<SubstateLockKey> for SubstateLockKeyCodec<(SubstateId, Transactio
         offset += n;
         let (block_height, n) = self.decode_block_height(&bytes[offset..])?;
         offset += n;
+        let (grant_seq, n) = self.decode_grant_seq(&bytes[offset..])?;
+        offset += n;
 
         Ok((
             SubstateLockKey {
@@ -209,6 +236,7 @@ impl DbDecoder<SubstateLockKey> for SubstateLockKeyCodec<(SubstateId, Transactio
                 substate_id,
                 transaction_id,
                 block_height,
+                grant_seq,
             },
             offset,
         ))

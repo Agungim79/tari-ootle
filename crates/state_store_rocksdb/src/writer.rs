@@ -365,6 +365,7 @@ impl<'tx, TAddr: NodeAddressable + 'tx> StateStoreWriteTransaction for RocksDbSt
             self.db().cf(CommitBlockCf)?.put(
                 &ByteColumn,
                 &CommitBlock {
+                    epoch: block.epoch(),
                     height: block.height(),
                     block_id: *block.id(),
                     parent_id: *block.parent(),
@@ -710,9 +711,9 @@ impl<'tx, TAddr: NodeAddressable + 'tx> StateStoreWriteTransaction for RocksDbSt
         let exec_query = self.db().cf(block_transaction_execution::ByTransactionIdQuery)?;
         let exec_index_cf = self.db().cf(block_transaction_execution::BlockIndex)?;
 
-        for (tx_id, block_id, height) in exec_query.query_prefix_range_keys(Ordering::default(), tx_id)? {
-            exec_cf.delete(&(tx_id, block_id, height), OPERATION)?;
-            exec_index_cf.delete(&(block_id, tx_id, height), OPERATION)?;
+        for (tx_id, block_id, epoch, height) in exec_query.query_prefix_range_keys(Ordering::default(), tx_id)? {
+            exec_cf.delete(&(tx_id, block_id, epoch, height), OPERATION)?;
+            exec_index_cf.delete(&(block_id, tx_id, epoch, height), OPERATION)?;
         }
 
         Ok(())
@@ -729,6 +730,7 @@ impl<'tx, TAddr: NodeAddressable + 'tx> StateStoreWriteTransaction for RocksDbSt
             &(
                 *transaction_execution.transaction_id(),
                 *transaction_execution.block_id(),
+                transaction_execution.block_epoch(),
                 transaction_execution.block_height(),
             ),
             OPERATION,
@@ -754,6 +756,7 @@ impl<'tx, TAddr: NodeAddressable + 'tx> StateStoreWriteTransaction for RocksDbSt
             &(
                 *transaction_execution.transaction_id(),
                 *transaction_execution.block_id(),
+                transaction_execution.block_epoch(),
                 transaction_execution.block_height(),
             ),
             transaction_execution,
@@ -764,6 +767,7 @@ impl<'tx, TAddr: NodeAddressable + 'tx> StateStoreWriteTransaction for RocksDbSt
             &(
                 *transaction_execution.block_id(),
                 *transaction_execution.transaction_id(),
+                transaction_execution.block_epoch(),
                 transaction_execution.block_height(),
             ),
             &(),
@@ -782,8 +786,8 @@ impl<'tx, TAddr: NodeAddressable + 'tx> StateStoreWriteTransaction for RocksDbSt
 
         for key in query.query_prefix_range_keys(Ordering::default(), block_id)? {
             index_cf.delete(&key, OPERATION)?;
-            let (block_id, tx_id, height) = key;
-            cf.delete(&(tx_id, block_id, height), OPERATION)?;
+            let (block_id, tx_id, epoch, height) = key;
+            cf.delete(&(tx_id, block_id, epoch, height), OPERATION)?;
         }
 
         Ok(())
@@ -800,18 +804,20 @@ impl<'tx, TAddr: NodeAddressable + 'tx> StateStoreWriteTransaction for RocksDbSt
         // Remove any executions prior to this block - we do this only if this block has an execution (if not, iter will
         // be empty). By the time the block that finalizes a transaction is committed - there will only be one
         // execution.
-        for (_, tx_id, locked_height) in
+        for (_, tx_id, locked_epoch, locked_height) in
             block_query.query_prefix_range_keys(Ordering::default(), lock_block.block_id())?
         {
-            for (tx_id, block_id, height) in tx_query.query_prefix_range_keys(Ordering::default(), &tx_id)? {
-                // Don't remove for this block or any later blocks (higher height)
-                if height > locked_height {
+            for (tx_id, block_id, epoch, height) in tx_query.query_prefix_range_keys(Ordering::default(), &tx_id)? {
+                // Don't remove for this block or any later blocks
+                if (epoch, height) > (locked_epoch, locked_height) {
                     trace!(
                         target: LOG_TARGET,
-                        "Skip deleting transaction execution for transaction {} in block {} ({} > {})",
+                        "Skip deleting transaction execution for transaction {} in block {} ({}/{} > {}/{})",
                         tx_id,
                         block_id,
+                        epoch,
                         height,
+                        locked_epoch,
                         locked_height
                     );
                     continue;
@@ -821,14 +827,16 @@ impl<'tx, TAddr: NodeAddressable + 'tx> StateStoreWriteTransaction for RocksDbSt
                 }
                 debug!(
                     target: LOG_TARGET,
-                    "Deleting transaction execution for transaction {} in block {} ({} <= {})",
+                    "Deleting transaction execution for transaction {} in block {} ({}/{} <= {}/{})",
                     tx_id,
                     block_id,
+                    epoch,
                     height,
+                    locked_epoch,
                     locked_height
                 );
-                cf.delete(&(tx_id, block_id, height), OPERATION)?;
-                index_cf.delete(&(block_id, tx_id, height), OPERATION)?;
+                cf.delete(&(tx_id, block_id, epoch, height), OPERATION)?;
+                index_cf.delete(&(block_id, tx_id, epoch, height), OPERATION)?;
             }
         }
 
@@ -1155,6 +1163,7 @@ impl<'tx, TAddr: NodeAddressable + 'tx> StateStoreWriteTransaction for RocksDbSt
                 let grant_seq = grant_seq as u32;
                 let key = SubstateLockKey {
                     block_id: *block.block_id(),
+                    block_epoch: block.epoch(),
                     block_height: block.height(),
                     substate_id: substate_id.clone(),
                     transaction_id: *lock.transaction_id(),
@@ -1163,11 +1172,7 @@ impl<'tx, TAddr: NodeAddressable + 'tx> StateStoreWriteTransaction for RocksDbSt
                 cf.put(&key, lock, OPERATION)?;
                 index_cf.put(&key, &(), OPERATION)?;
                 substate_index_cf.put(&key, &lock.lock_type(), OPERATION)?;
-                chain_order_cf.put(
-                    &(substate_id.clone(), block.height(), *block.block_id(), grant_seq),
-                    lock.transaction_id(),
-                    OPERATION,
-                )?;
+                chain_order_cf.put(&key.to_chain_order_key(), lock.transaction_id(), OPERATION)?;
             }
         }
 
@@ -1199,10 +1204,7 @@ impl<'tx, TAddr: NodeAddressable + 'tx> StateStoreWriteTransaction for RocksDbSt
                 cf.delete(&key, OPERATION)?;
                 index_cf.delete(&key, OPERATION)?;
                 substate_index_cf.delete(&key, OPERATION)?;
-                chain_order_cf.delete(
-                    &(key.substate_id.clone(), key.block_height, key.block_id, key.grant_seq),
-                    OPERATION,
-                )?;
+                chain_order_cf.delete(&key.to_chain_order_key(), OPERATION)?;
             }
         }
 
@@ -1221,10 +1223,7 @@ impl<'tx, TAddr: NodeAddressable + 'tx> StateStoreWriteTransaction for RocksDbSt
             cf.delete(&key, OPERATION)?;
             index_cf.delete(&key, OPERATION)?;
             substate_index_cf.delete(&key, OPERATION)?;
-            chain_order_cf.delete(
-                &(key.substate_id.clone(), key.block_height, key.block_id, key.grant_seq),
-                OPERATION,
-            )?;
+            chain_order_cf.delete(&key.to_chain_order_key(), OPERATION)?;
         }
 
         Ok(())
@@ -1913,9 +1912,9 @@ mod cleanup {
         for (epoch, tx_id) in keys {
             tx_cf.delete(&tx_id, OPERATION)?;
             link_cf.delete(&tx_id, OPERATION)?;
-            for (tx_id, block_id, height) in exec_query.query_prefix_range_keys(Ordering::default(), &tx_id)? {
-                exec_cf.delete(&(tx_id, block_id, height), OPERATION)?;
-                exec_index_cf.delete(&(block_id, tx_id, height), OPERATION)?;
+            for (tx_id, block_id, epoch, height) in exec_query.query_prefix_range_keys(Ordering::default(), &tx_id)? {
+                exec_cf.delete(&(tx_id, block_id, epoch, height), OPERATION)?;
+                exec_index_cf.delete(&(block_id, tx_id, epoch, height), OPERATION)?;
             }
             epoch_index_cf.delete(&(epoch, tx_id), OPERATION)?;
             count += 1;

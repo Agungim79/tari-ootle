@@ -6,6 +6,7 @@ pub mod helpers;
 use std::collections::HashMap;
 
 use indexmap::IndexMap;
+use tari_consensus_types::LeafBlock;
 use tari_engine_types::substate::SubstateId;
 use tari_ootle_common_types::{SubstateLockType, SubstateVersion, optional::Optional};
 use tari_ootle_storage::{
@@ -17,6 +18,7 @@ use tari_ootle_storage::{
 use tari_ootle_transaction::TransactionId;
 
 use crate::helpers::{
+    chain_across_an_epoch_change,
     commit_chain,
     create_block_with_qc,
     create_chain,
@@ -592,4 +594,85 @@ fn a_transaction_keeps_both_its_input_and_output_lock_on_one_substate() {
         );
         tx.rollback().unwrap();
     }
+}
+
+/// A lock the previous epoch committed is on the chain, however high its block sits relative to this epoch's commit
+/// block.
+#[test]
+fn a_lock_committed_in_the_previous_epoch_is_found() {
+    let (db, _tmp) = create_rocksdb();
+    let mut tx = db.create_write_tx().unwrap();
+
+    let chain = chain_across_an_epoch_change(10, 5);
+    commit_chain(&mut tx, &chain);
+    let prev_epoch_block = chain[8].as_leaf();
+    let leaf = chain.last().unwrap().as_leaf();
+    assert!(prev_epoch_block.epoch() < leaf.epoch());
+    let commit_block = &chain[chain.len() - 4];
+    assert!(prev_epoch_block.height() > commit_block.height());
+
+    let substate_id = create_random_substate_id();
+    let transaction_id = transaction_id_from_seed(1);
+    let locks = IndexMap::from([(substate_id.clone(), vec![SubstateLock::new(
+        transaction_id,
+        SubstateVersion::new(0),
+        SubstateLockType::Write,
+        false,
+    )])]);
+    tx.substate_locks_insert_all(&prev_epoch_block, &locks).unwrap();
+
+    let locked = tx
+        .substate_locks_get_locked_substates_for_transaction(&leaf, &transaction_id)
+        .unwrap();
+    assert_eq!(
+        locked.len(),
+        1,
+        "the previous epoch's lock is missing from the transaction's locks"
+    );
+
+    let lock = tx
+        .substate_locks_get_latest_for_substate(&leaf, &substate_id)
+        .optional()
+        .unwrap();
+    assert_eq!(lock.map(|l| *l.transaction_id()), Some(transaction_id));
+
+    let conflict = tx
+        .substate_locks_has_any_write_locks_for_substates(&leaf, None, [&substate_id])
+        .unwrap();
+    assert_eq!(conflict, Some(transaction_id));
+
+    tx.rollback().unwrap();
+}
+
+/// A lock granted in this epoch is more recent than any the previous epoch granted, whatever the two blocks' heights.
+#[test]
+fn the_latest_lock_across_an_epoch_change_is_this_epochs() {
+    let (db, _tmp) = create_rocksdb();
+    let mut tx = db.create_write_tx().unwrap();
+
+    let chain = chain_across_an_epoch_change(10, 5);
+    commit_chain(&mut tx, &chain);
+    let prev_epoch_block = chain[8].as_leaf();
+    let this_epoch_block = chain.last().unwrap().as_leaf();
+    assert!(prev_epoch_block.height() > this_epoch_block.height());
+
+    let substate_id = create_random_substate_id();
+    let insert_read_lock = |tx: &mut _, block: &LeafBlock, seed: u32| {
+        let locks = IndexMap::from([(substate_id.clone(), vec![SubstateLock::new(
+            transaction_id_from_seed(seed),
+            SubstateVersion::new(0),
+            SubstateLockType::Read,
+            false,
+        )])]);
+        StateStoreWriteTransaction::substate_locks_insert_all(tx, block, &locks).unwrap();
+    };
+    insert_read_lock(&mut tx, &prev_epoch_block, 1);
+    insert_read_lock(&mut tx, &this_epoch_block, 2);
+
+    let lock = tx
+        .substate_locks_get_latest_for_substate(&this_epoch_block, &substate_id)
+        .unwrap();
+    assert_eq!(lock.transaction_id(), &transaction_id_from_seed(2));
+
+    tx.rollback().unwrap();
 }

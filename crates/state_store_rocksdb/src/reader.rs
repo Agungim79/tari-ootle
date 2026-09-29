@@ -270,7 +270,7 @@ impl<'a, TAddr: NodeAddressable + Serialize + DeserializeOwned + 'a, R: RocksRea
         let commit = self
             .get_commit_block()
             .optional()?
-            .map(|commit| (commit.block_id, commit.height));
+            .map(|commit| (commit.block_id, commit.epoch, commit.height));
         Ok(PendingChain::from_walk(*leaf, walk, commit))
     }
 
@@ -287,7 +287,7 @@ impl<'a, TAddr: NodeAddressable + Serialize + DeserializeOwned + 'a, R: RocksRea
             "pending chain for {} is stale: its ancestry differs from the pending-chain index",
             chain.leaf()
         );
-        if chain.commit_height().is_some() {
+        if chain.commit_position().is_some() {
             let ordered = self.get_pending_chain_ordered(chain.leaf())?;
             assert_eq!(
                 ordered,
@@ -305,34 +305,38 @@ impl<'a, TAddr: NodeAddressable + Serialize + DeserializeOwned + 'a, R: RocksRea
     /// by a block on another branch must not answer a question asked about this one.
     pub(super) fn chain_scope(&self, leaf_block: &BlockId) -> Result<PendingChain, RocksDbStorageError> {
         let chain = self.read_pending_chain(leaf_block)?;
-        self.require_commit_height(&chain)?;
+        self.require_commit_position(&chain)?;
         Ok(chain)
     }
 
-    fn require_commit_height(&self, chain: &PendingChain) -> Result<NodeHeight, RocksDbStorageError> {
-        match chain.commit_height() {
-            Some(height) => Ok(height),
+    fn require_commit_position(&self, chain: &PendingChain) -> Result<(Epoch, NodeHeight), RocksDbStorageError> {
+        match chain.commit_position() {
+            Some(position) => Ok(position),
             // Raises the missing commit block as the error the direct read gives.
-            None => Ok(self.get_commit_block()?.height),
+            None => {
+                let commit_block = self.get_commit_block()?;
+                Ok((commit_block.epoch, commit_block.height))
+            },
         }
     }
 
     /// Whether `block` is on the chain `scope` ends in.
     ///
     /// Committing a block removes it from the pending chain, and every pending block sits above the commit block. So a
-    /// block at or below the commit height that has left the pending chain was committed by the chain that committed
-    /// that height, while a branch block still lingering there was not.
+    /// block at or below the commit block's (epoch, height) that has left the pending chain was committed by the chain
+    /// that committed that position, while a branch block still lingering there was not.
     pub(super) fn is_in_chain_scope(
         &self,
         scope: &PendingChain,
         block: &BlockId,
+        epoch: Epoch,
         height: NodeHeight,
     ) -> Result<bool, RocksDbStorageError> {
         const OPERATION: &str = "is_in_chain_scope";
         if scope.contains_pending(block) {
             return Ok(true);
         }
-        if height > self.require_commit_height(scope)? {
+        if (epoch, height) > self.require_commit_position(scope)? {
             return Ok(false);
         }
         Ok(!self.db().cf(chain::PendingChainIndex)?.exists(block, OPERATION)?)
@@ -771,16 +775,13 @@ impl<'tx, TAddr: NodeAddressable + Serialize + DeserializeOwned + 'tx, R: RocksR
         }
         let cf = self.db().cf(block_transaction_execution::ByTransactionIdQuery)?;
         let mut iter = cf.query_prefix_range_key_iterator(Ordering::default(), tx_id);
-        let Some((tx_id, block_id, height)) = iter.next().transpose()? else {
+        let Some(key) = iter.next().transpose()? else {
             return Err(StorageError::NotFound {
                 item: "TransactionExecution",
                 key: format!("{tx_id}"),
             });
         };
-        let execution = self
-            .db()
-            .cf(BlockTransactionExecutionCf)?
-            .get(&(tx_id, block_id, height), OPERATION)?;
+        let execution = self.db().cf(BlockTransactionExecutionCf)?.get(&key, OPERATION)?;
 
         Ok(execution.into_transaction_execution())
     }
@@ -813,7 +814,12 @@ impl<'tx, TAddr: NodeAddressable + Serialize + DeserializeOwned + 'tx, R: RocksR
         // Is the execution is in the queried block
         if let Some(exec) = cf
             .get(
-                &(*transaction_id, *from_block.block_id(), from_block.height()),
+                &(
+                    *transaction_id,
+                    *from_block.block_id(),
+                    from_block.epoch(),
+                    from_block.height(),
+                ),
                 OPERATION,
             )
             .optional()?
@@ -835,22 +841,24 @@ impl<'tx, TAddr: NodeAddressable + Serialize + DeserializeOwned + 'tx, R: RocksR
         let pending_chain = self.get_pending_chain_until(from_block.block_id())?;
         let pending_index = self.db().cf(chain::PendingChainIndex)?;
 
-        let mut best: Option<(TransactionId, BlockId, NodeHeight)> = None;
+        // Heights restart at zero each epoch, so the most recent ancestor is the one with the highest (epoch, height).
+        let mut best: Option<(TransactionId, BlockId, Epoch, NodeHeight)> = None;
         let candidates = query.query_prefix_range_key_iterator(Ordering::default(), transaction_id);
         for res in candidates {
-            let (tx_id, block_id, height) = res?;
+            let (tx_id, block_id, epoch, height) = res?;
             let is_ancestor = pending_chain.contains(&block_id) || !pending_index.exists(&block_id, OPERATION)?;
-            if is_ancestor && best.as_ref().is_none_or(|(_, _, h)| *h < height) {
-                best = Some((tx_id, block_id, height));
+            if is_ancestor && best.as_ref().is_none_or(|(_, _, e, h)| (*e, *h) < (epoch, height)) {
+                best = Some((tx_id, block_id, epoch, height));
             }
         }
 
-        if let Some((tx_id, block_id, height)) = best {
+        if let Some(key) = best {
+            let (_, block_id, epoch, height) = key;
             debug!(
                 target: LOG_TARGET,
-                "{OPERATION}: Found execution for {transaction_id} in {block_id} {height}",
+                "{OPERATION}: Found execution for {transaction_id} in {block_id} {epoch}/{height}",
             );
-            let execution = cf.get(&(tx_id, block_id, height), OPERATION)?;
+            let execution = cf.get(&key, OPERATION)?;
             return Ok(execution);
         }
 
@@ -871,8 +879,8 @@ impl<'tx, TAddr: NodeAddressable + Serialize + DeserializeOwned + 'tx, R: RocksR
 
         let mut executions = Vec::new();
         for result in query.query_prefix_range_key_iterator(Ordering::default(), block_id) {
-            let (block_id, tx_id, height) = result?;
-            let execution = cf.get(&(tx_id, block_id, height), OPERATION)?;
+            let (block_id, tx_id, epoch, height) = result?;
+            let execution = cf.get(&(tx_id, block_id, epoch, height), OPERATION)?;
             executions.push(execution);
         }
 
@@ -1656,7 +1664,7 @@ impl<'tx, TAddr: NodeAddressable + Serialize + DeserializeOwned + 'tx, R: RocksR
 
         for result in iter {
             let (key, lock) = result?;
-            if !self.is_in_chain_scope(&scope, &key.block_id, key.block_height)? {
+            if !self.is_in_chain_scope(&scope, &key.block_id, key.block_epoch, key.block_height)? {
                 continue;
             }
             let substate = substates_cf
@@ -1705,7 +1713,7 @@ impl<'tx, TAddr: NodeAddressable + Serialize + DeserializeOwned + 'tx, R: RocksR
                 if exclude_transaction_id.is_some_and(|ex| *ex == key.transaction_id) {
                     continue;
                 }
-                if !self.is_in_chain_scope(&scope, &key.block_id, key.block_height)? {
+                if !self.is_in_chain_scope(&scope, &key.block_id, key.block_epoch, key.block_height)? {
                     continue;
                 }
 
@@ -1720,8 +1728,8 @@ impl<'tx, TAddr: NodeAddressable + Serialize + DeserializeOwned + 'tx, R: RocksR
     /// pending blocks and then the committed chain beneath them.
     ///
     /// The answer is a property of that chain alone: locks granted by blocks on other branches are skipped. The
-    /// chain-order index orders a substate's locks by (block_height, grant_seq), which totally orders the locks any one
-    /// chain holds, so the first entry the descending scan accepts is the answer.
+    /// chain-order index orders a substate's locks by (block_epoch, block_height, grant_seq), which totally orders the
+    /// locks any one chain holds, so the first entry the descending scan accepts is the answer.
     ///
     /// # Used for:
     /// Local proposal conflict resolution, to check if a substate is locked by another transaction.
@@ -1736,13 +1744,14 @@ impl<'tx, TAddr: NodeAddressable + Serialize + DeserializeOwned + 'tx, R: RocksR
 
         let query = self.db().cf(substate_locks::ByChainOrderQuery)?;
         for result in query.query_prefix_range_iterator(Ordering::Descending, substate_id) {
-            let ((_, block_height, block_id, grant_seq), transaction_id) = result?;
-            if !self.is_in_chain_scope(scope, &block_id, block_height)? {
+            let ((_, block_epoch, block_height, block_id, grant_seq), transaction_id) = result?;
+            if !self.is_in_chain_scope(scope, &block_id, block_epoch, block_height)? {
                 continue;
             }
 
             let lock_key = substate_locks::SubstateLockKey {
                 block_id,
+                block_epoch,
                 block_height,
                 substate_id: substate_id.clone(),
                 transaction_id,

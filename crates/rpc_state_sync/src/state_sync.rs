@@ -54,7 +54,7 @@ use tari_ootle_storage::{
         SubstateValueFilterFlags,
     },
 };
-use tari_rpc_framework::{RpcError, RpcStatusCode};
+use tari_rpc_framework::RpcError;
 use tari_state_tree::{SPARSE_MERKLE_PLACEHOLDER_HASH, SpreadPrefixStateTree, SubstateTreeChange, TreeHash, Version};
 use tari_template_lib_types::crypto::RistrettoPublicKeyBytes;
 use tari_validator_node_rpc::{
@@ -514,24 +514,6 @@ where TConsensusSpec: ConsensusSpec<Addr = PeerAddress>
         Ok(())
     }
 
-    fn is_checkpoint_temporarily_unavailable_error(err: &RpcStateSyncError, prev_epoch: Epoch) -> bool {
-        match err {
-            RpcStateSyncError::CheckpointNotAvailable { epoch } => *epoch == prev_epoch,
-            RpcStateSyncError::RpcError(RpcError::RequestFailed(status)) => {
-                let details = status.details();
-                // Remote node count be behind in syncing the epoch oracle
-                (status.as_status_code() == RpcStatusCode::BadRequest &&
-                    details.contains(&format!("Peer requested checkpoint with epoch {}", prev_epoch))) ||
-                    // Remote node is syncing
-                    (status.as_status_code() == RpcStatusCode::General &&
-                        (details.contains("Consensus is not running on this node") ||
-                            details.contains("Node is still catching up to the epoch") ||
-                            details.contains("Node is not in sync with the consensus epoch")))
-            },
-            _ => false,
-        }
-    }
-
     /// Synchronizes the given [`Shard`].
     async fn sync_shard(
         &mut self,
@@ -546,7 +528,7 @@ where TConsensusSpec: ConsensusSpec<Addr = PeerAddress>
         info!(target: LOG_TARGET, "🛜 Syncing state for shard {shard} and epoch {}", prev_epoch);
 
         let mut last_hard_error = None;
-        let mut saw_unavailable_checkpoint = false;
+        let mut saw_unavailable_peer = false;
 
         for member in &source.serving_peers {
             let mut client = match self.establish_rpc_session(&member.address).await {
@@ -573,12 +555,12 @@ where TConsensusSpec: ConsensusSpec<Addr = PeerAddress>
                         "❓️ No checkpoint for epoch {prev_epoch} from {member}. Previous committee exists, so state \
                          sync will retry instead of proceeding without a checkpoint.",
                     );
-                    saw_unavailable_checkpoint = true;
+                    saw_unavailable_peer = true;
                     continue;
                 },
                 Err(err) => {
-                    if Self::is_checkpoint_temporarily_unavailable_error(&err, prev_epoch) {
-                        saw_unavailable_checkpoint = true;
+                    if is_checkpoint_temporarily_unavailable(&err, prev_epoch) {
+                        saw_unavailable_peer = true;
                         warn!(
                             target: LOG_TARGET,
                             "⚠️Checkpoint for epoch {prev_epoch} is not yet available from {member}: {err}. \
@@ -607,6 +589,15 @@ where TConsensusSpec: ConsensusSpec<Addr = PeerAddress>
                 Ok(maybe_version) => {
                     return Ok(maybe_version);
                 },
+                Err(err) if is_peer_unavailable(&err) => {
+                    saw_unavailable_peer = true;
+                    warn!(
+                        target: LOG_TARGET,
+                        "⚠️{member} is not ready to serve state for shard {shard}: {err}. Attempting another peer if \
+                         available"
+                    );
+                    continue;
+                },
                 Err(err) => {
                     warn!(
                         target: LOG_TARGET,
@@ -622,7 +613,7 @@ where TConsensusSpec: ConsensusSpec<Addr = PeerAddress>
             return Err(err);
         }
 
-        if saw_unavailable_checkpoint {
+        if saw_unavailable_peer {
             return Err(RpcStateSyncError::CheckpointNotAvailable { epoch: prev_epoch });
         }
 
@@ -1151,5 +1142,67 @@ fn extract_tree_change(
         SubstateUpdateProof::Destroy(destroy) => Ok(SubstateTreeChange::Down {
             id: destroy.to_versioned_substate_id(),
         }),
+    }
+}
+
+/// True if the peer could not supply the `prev_epoch` checkpoint yet, which another peer or a later attempt
+/// may.
+fn is_checkpoint_temporarily_unavailable(err: &RpcStateSyncError, prev_epoch: Epoch) -> bool {
+    match err {
+        RpcStateSyncError::CheckpointNotAvailable { epoch } => *epoch == prev_epoch,
+        err => is_peer_unavailable(err),
+    }
+}
+
+/// True if the peer rejected the request because it is not yet in a state to serve it.
+fn is_peer_unavailable(err: &RpcStateSyncError) -> bool {
+    matches!(err, RpcStateSyncError::RpcError(RpcError::RequestFailed(status)) if status.is_unavailable())
+}
+
+#[cfg(test)]
+mod tests {
+    use tari_rpc_framework::RpcStatus;
+
+    use super::*;
+
+    fn request_failed(status: RpcStatus) -> RpcStateSyncError {
+        RpcStateSyncError::RpcError(RpcError::RequestFailed(status))
+    }
+
+    #[test]
+    fn an_unavailable_peer_is_temporary_whatever_its_details() {
+        assert!(is_checkpoint_temporarily_unavailable(
+            &request_failed(RpcStatus::unavailable("")),
+            Epoch(3)
+        ));
+    }
+
+    #[test]
+    fn only_an_unavailable_rejection_marks_the_peer_unavailable() {
+        assert!(is_peer_unavailable(&request_failed(RpcStatus::unavailable(""))));
+        assert!(!is_peer_unavailable(&request_failed(RpcStatus::general(""))));
+        assert!(!is_peer_unavailable(&RpcStateSyncError::CheckpointNotAvailable {
+            epoch: Epoch(3)
+        }));
+    }
+
+    #[test]
+    fn a_general_failure_is_not_temporary() {
+        assert!(!is_checkpoint_temporarily_unavailable(
+            &request_failed(RpcStatus::general("Consensus is not running on this node")),
+            Epoch(3)
+        ));
+    }
+
+    #[test]
+    fn a_missing_checkpoint_is_temporary_only_for_the_requested_epoch() {
+        assert!(is_checkpoint_temporarily_unavailable(
+            &RpcStateSyncError::CheckpointNotAvailable { epoch: Epoch(3) },
+            Epoch(3)
+        ));
+        assert!(!is_checkpoint_temporarily_unavailable(
+            &RpcStateSyncError::CheckpointNotAvailable { epoch: Epoch(2) },
+            Epoch(3)
+        ));
     }
 }

@@ -21,11 +21,12 @@
 //  USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 
 import { useErrorNotification } from "@/contexts/ErrorNotificationContext";
-import { useAccountsCreateFreeTestCoins } from "@api/hooks/useAccounts";
+import { useAccountsCreateFreeTestCoins, useFaucetBalance } from "@api/hooks/useAccounts";
 import { useWalletInfo } from "@api/hooks/useWalletInfo";
 import queryClient from "@api/queryClient";
 import CheckCircleOutlineIcon from "@mui/icons-material/CheckCircleOutline";
 import Button from "@mui/material/Button";
+import Tooltip from "@mui/material/Tooltip";
 import { useTheme } from "@mui/material/styles";
 import useMediaQuery from "@mui/material/useMediaQuery";
 import useAccountStore, { setAccount, setOotleAddress } from "@store/accountStore";
@@ -39,11 +40,13 @@ function ClaimCoinsButton() {
   const { showError, showSuccess } = useErrorNotification();
   const [hasClaimed, setHasClaimed] = useState(false);
   const { data: walletInfo } = useWalletInfo();
+  const isTestnet = !!walletInfo && walletInfo.network !== "mainnet";
 
   const theme = useTheme();
   const isLg = useMediaQuery(theme.breakpoints.up("md"));
 
   const accountAddress = account ? substateIdToString(account.component_address) : null;
+  const { data: faucet } = useFaucetBalance(isTestnet && !!accountAddress && !hasClaimed);
 
   useEffect(() => {
     if (!accountAddress) return;
@@ -83,9 +86,11 @@ function ClaimCoinsButton() {
     return <></>;
   }
 
-  if (!walletInfo || walletInfo.network === "mainnet") {
+  if (!isTestnet) {
     return <></>;
   }
+
+  const faucetIsEmpty = !!faucet && BigInt(faucet.balance) < BigInt(faucet.claim_amount);
 
   const onClaimFreeCoins = () => {
     claimTestnetFaucetFunds(
@@ -114,7 +119,9 @@ function ClaimCoinsButton() {
         },
         onError: (error: any) => {
           console.error("Error claiming coins:", error);
-          if ((error?.cause as any)?.code === 1001) {
+          if ((error?.cause as any)?.code === 1002) {
+            showError("The testnet faucet is empty. Burn on L1 to claim tTARI instead.");
+          } else if ((error?.cause as any)?.code === 1001) {
             markClaimed();
             showError("You have already claimed your testnet funds. Each account can only claim once.");
           } else {
@@ -130,6 +137,18 @@ function ClaimCoinsButton() {
       <Button variant="outlined" disabled startIcon={<CheckCircleOutlineIcon />} size={isLg ? "large" : "small"}>
         Already Claimed
       </Button>
+    );
+  }
+
+  if (faucetIsEmpty) {
+    return (
+      <Tooltip title="The testnet faucet is empty. Burn on L1 to claim tTARI instead.">
+        <span>
+          <Button variant="outlined" disabled size={isLg ? "large" : "small"}>
+            Faucet Empty
+          </Button>
+        </span>
+      </Tooltip>
     );
   }
 

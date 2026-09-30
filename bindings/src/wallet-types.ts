@@ -23,6 +23,8 @@ export * from "./types/wallet-types/AccountsGetBalanceChangesRequest";
 export * from "./types/wallet-types/AccountsGetBalanceChangesResponse";
 export * from "./types/wallet-types/AccountsGetBalancesRequest";
 export * from "./types/wallet-types/AccountsGetBalancesResponse";
+export * from "./types/wallet-types/AccountsGetFaucetBalanceRequest";
+export * from "./types/wallet-types/AccountsGetFaucetBalanceResponse";
 export * from "./types/wallet-types/AccountsListRequest";
 export * from "./types/wallet-types/AccountsListResponse";
 export * from "./types/wallet-types/AccountsRenameRequest";

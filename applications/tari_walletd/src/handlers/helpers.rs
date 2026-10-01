@@ -208,6 +208,17 @@ pub(super) fn invalid_request<T: Display>(details: T) -> anyhow::Error {
     )
 }
 
+/// Seed recovery checks account key indexes from 0, adds an account for each and removes the unused ones when it
+/// finishes. An account created while it runs takes one of those indexes.
+pub(super) fn ensure_seed_recovery_finished<TSpec: WalletSdkSpec>(sdk: &WalletSdk<TSpec>) -> Result<(), anyhow::Error> {
+    if sdk.is_recovery_needed()? {
+        return Err(invalid_request(
+            "the wallet is still recovering accounts from its seed. Create the account after recovery has finished",
+        ));
+    }
+    Ok(())
+}
+
 pub(super) fn unauthorized<T: Display>(details: T) -> anyhow::Error {
     application_error(ApplicationErrorCode::Unauthorized, format!("Unauthorized: {details}"))
 }

@@ -27,16 +27,26 @@
 //! source. A cache hit serves these counts verbatim out of the file header without re-deriving
 //! them, and they price `instantiation_points` into a committed fee receipt, so a node that
 //! counted differently when it wrote the file charges a different fee than one compiling fresh.
-//! The limits enforced here are in the same position: `max_tables` and `max_globals` are checked
-//! at compile time only, and a hit never reaches them.
+//! The limits enforced here are in the same position: `max_tables`, `max_globals`,
+//! `max_module_functions` and `max_module_variables` are checked at compile time only, and a hit
+//! never reaches them.
 
-use tari_engine_types::limits::{self, ModuleShape};
-use wasmer::wasmparser::{DataKind, ElementItems, ElementKind, Parser, Payload};
+use tari_engine_types::limits::{self, CompileCounts, ModuleShape};
+use wasmer::wasmparser::{DataKind, ElementItems, ElementKind, Parser, Payload, TypeRef};
 
 use crate::wasm::WasmValidationError;
 
+/// What [`validate_module_structure`] reads out of a module before it is compiled.
+#[derive(Debug, Clone, Copy)]
+pub struct ModuleStructure {
+    /// The counts that price each instantiation.
+    pub shape: ModuleShape,
+    /// The functions and variables the compile emits code for.
+    pub compile: CompileCounts,
+}
+
 /// Checks what only the module bytes show: that the module declares no start function, and no more
-/// tables or globals than the limits.
+/// tables, globals, functions or variables than the limits.
 ///
 /// A start function runs on every instantiation, before the engine has installed this call's
 /// metering allowance and outside any invocation it could attribute effects to. Templates have no
@@ -46,14 +56,45 @@ use crate::wasm::WasmValidationError;
 /// declaration far smaller than what it claims. Each table's element count is bounded by the
 /// tunables, which see one table at a time, so the number of tables is what bounds the storage all
 /// of them together claim; a global's slot is fixed, so its count is the whole bound.
-pub(crate) fn validate_module_structure(code: &[u8]) -> Result<ModuleShape, WasmValidationError> {
+///
+/// Functions and the parameters and locals they declare are bounded because the compile's cost for
+/// each is far above what the bytes declaring it are priced at, and the compile runs before
+/// anything else could refuse the module.
+pub(crate) fn validate_module_structure(code: &[u8]) -> Result<ModuleStructure, WasmValidationError> {
     let mut shape = ModuleShape::default();
+    let mut compile = CompileCounts::default();
+    // Parameter count of each signature in the type section, which precedes every section that
+    // refers to it.
+    let mut type_params = Vec::new();
     for payload in Parser::new(0).parse_all(code) {
         // Malformed wasm: stop and let the cranelift compile in
         // `load_template_from_code` report the canonical CompileError.
         let Ok(payload) = payload else { break };
         match payload {
             Payload::StartSection { .. } => return Err(WasmValidationError::StartSectionNotAllowed),
+            Payload::TypeSection(reader) => {
+                for ty in reader.into_iter_err_on_gc_types().flatten() {
+                    type_params.push(ty.params().len() as u64);
+                }
+            },
+            Payload::ImportSection(reader) => {
+                for import in reader.into_imports().flatten() {
+                    if let TypeRef::Func(ty) | TypeRef::FuncExact(ty) = import.ty {
+                        add_function(&mut compile, &type_params, ty)?;
+                    }
+                }
+            },
+            Payload::FunctionSection(reader) => {
+                for ty in reader.into_iter().flatten() {
+                    add_function(&mut compile, &type_params, ty)?;
+                }
+            },
+            Payload::CodeSectionEntry(body) => {
+                let Ok(locals) = body.get_locals_reader() else { break };
+                for (count, _) in locals.into_iter().flatten() {
+                    add_variables(&mut compile, u64::from(count))?;
+                }
+            },
             Payload::TableSection(reader) => {
                 let count = reader.count() as usize;
                 if count > limits::WASM_LIMITS.max_tables {
@@ -102,5 +143,26 @@ pub(crate) fn validate_module_structure(code: &[u8]) -> Result<ModuleShape, Wasm
             _ => {},
         }
     }
-    Ok(shape)
+    Ok(ModuleStructure { shape, compile })
+}
+
+/// Counts a function of signature `ty` and its parameters. A signature the type section does not
+/// declare leaves the module for the compile to refuse.
+fn add_function(compile: &mut CompileCounts, type_params: &[u64], ty: u32) -> Result<(), WasmValidationError> {
+    compile.functions = compile.functions.saturating_add(1);
+    let max_functions = limits::WASM_LIMITS.max_module_functions;
+    if compile.functions > max_functions as u64 {
+        return Err(WasmValidationError::TooManyModuleFunctions { max_functions });
+    }
+    let params = type_params.get(ty as usize).copied().unwrap_or(0);
+    add_variables(compile, params)
+}
+
+fn add_variables(compile: &mut CompileCounts, count: u64) -> Result<(), WasmValidationError> {
+    compile.variables = compile.variables.saturating_add(count);
+    let max_variables = limits::WASM_LIMITS.max_module_variables;
+    if compile.variables > max_variables as u64 {
+        return Err(WasmValidationError::TooManyModuleVariables { max_variables });
+    }
+    Ok(())
 }

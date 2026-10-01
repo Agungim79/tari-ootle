@@ -3,6 +3,7 @@
 use std::collections::{BTreeMap, HashMap};
 
 use tari_engine::runtime::{ActionIdent, RuntimeError};
+use tari_engine_types::resource_container::ResourceError;
 use tari_ootle_transaction::{Epoch, Transaction, args};
 use tari_template_lib::{
     args::ComponentAction,
@@ -1035,6 +1036,106 @@ mod resource_access_rules {
                 .drop_all_proofs_in_workspace()
                 .build_and_seal(&user_key),
             vec![user_proof.clone()],
+        );
+    }
+
+    /// A resource rule requires possession. A vault emptied of its badges cannot prove a zero amount or an empty set
+    /// of token ids to satisfy it.
+    #[test]
+    fn an_empty_proof_cannot_satisfy_a_resource_rule() {
+        let mut test = TemplateTest::new(CRATE_PATH, ["tests/templates/access_rules"]);
+
+        let (owner_proof, _, owner_key) = test.create_owner_proof();
+        let (user_account, user_proof, user_key) = test.create_empty_account();
+        let (other_account, _, _) = test.create_empty_account();
+
+        let access_rules_template = test.get_template_address("AccessRulesTest");
+
+        let result = test.execute_expect_success(
+            Transaction::builder_localnet(Epoch(1))
+                .call_function(access_rules_template, "using_resource_rules", args![])
+                .build_and_seal(&owner_key),
+            vec![owner_proof.clone()],
+        );
+
+        let access_rules_component = result.finalize.execution_results[0]
+            .decode::<ComponentAddress>()
+            .unwrap();
+        let badge_resource = result
+            .finalize
+            .result
+            .any_accept()
+            .unwrap()
+            .up_iter()
+            .filter_map(|(addr, s)| s.substate_value().as_resource().map(|r| (addr, r)))
+            .filter(|(_, r)| r.resource_type().is_non_fungible())
+            .map(|(addr, _)| addr.as_resource_address().unwrap())
+            .next()
+            .unwrap();
+
+        // The user holds a badge, then hands it on, leaving an empty badge vault in their account.
+        test.execute_expect_success(
+            Transaction::builder_localnet(Epoch(1))
+                .call_method(access_rules_component, "mint_new_badge", args![])
+                .put_last_instruction_output_on_workspace("permission")
+                .call_method(user_account, "deposit", args![Workspace("permission")])
+                .build_and_seal(&owner_key),
+            vec![owner_proof],
+        );
+        test.execute_expect_success(
+            Transaction::builder_localnet(Epoch(1))
+                .call_method(user_account, "withdraw", args![badge_resource, 1])
+                .put_last_instruction_output_on_workspace("badge")
+                .call_method(other_account, "deposit", args![Workspace("badge")])
+                .build_and_seal(&user_key),
+            vec![user_proof.clone()],
+        );
+
+        let reason = test.execute_expect_failure(
+            Transaction::builder_localnet(Epoch(1))
+                .call_method(user_account, "create_proof_by_amount", args![badge_resource, 0])
+                .put_last_instruction_output_on_workspace("proof")
+                .call_method(access_rules_component, "take_tokens_using_proof", args![
+                    Workspace("proof"),
+                    10
+                ])
+                .put_last_instruction_output_on_workspace("tokens")
+                .call_method(user_account, "deposit_with_auth", args![
+                    Workspace("tokens"),
+                    Workspace("proof")
+                ])
+                .drop_all_proofs_in_workspace()
+                .build_and_seal(&user_key),
+            vec![user_proof.clone()],
+        );
+        assert_reject_reason(
+            reason,
+            ResourceError::OperationNotAllowed("A proof must lock a non-zero amount".to_string()),
+        );
+
+        let reason = test.execute_expect_failure(
+            Transaction::builder_localnet(Epoch(1))
+                .call_method(user_account, "create_proof_by_non_fungible_ids", args![
+                    badge_resource,
+                    Vec::<NonFungibleId>::new()
+                ])
+                .put_last_instruction_output_on_workspace("proof")
+                .call_method(access_rules_component, "take_tokens_using_proof", args![
+                    Workspace("proof"),
+                    10
+                ])
+                .put_last_instruction_output_on_workspace("tokens")
+                .call_method(user_account, "deposit_with_auth", args![
+                    Workspace("tokens"),
+                    Workspace("proof")
+                ])
+                .drop_all_proofs_in_workspace()
+                .build_and_seal(&user_key),
+            vec![user_proof],
+        );
+        assert_reject_reason(
+            reason,
+            ResourceError::OperationNotAllowed("A proof must lock at least one token id".to_string()),
         );
     }
 

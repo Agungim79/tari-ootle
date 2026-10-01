@@ -55,6 +55,11 @@ impl Proof {
         self.locked.resource_type()
     }
 
+    /// True if the proof locks no amount, token or commitment of its resource.
+    pub fn is_empty(&self) -> bool {
+        self.locked.locked.is_empty()
+    }
+
     pub fn container(&self) -> &ContainerRef {
         &self.locked.container
     }

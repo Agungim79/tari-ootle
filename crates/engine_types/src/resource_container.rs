@@ -824,6 +824,12 @@ impl ResourceContainer {
     }
 
     pub fn lock_by_non_fungible_ids(&mut self, ids: BTreeSet<NonFungibleId>) -> Result<Self, ResourceError> {
+        // A proof is accepted as possession of its resource, so it must lock at least one token.
+        if ids.is_empty() {
+            return Err(ResourceError::OperationNotAllowed(
+                "A proof must lock at least one token id".to_string(),
+            ));
+        }
         match self {
             Self::Fungible { .. } => Err(ResourceError::OperationNotAllowed(
                 "Cannot lock by NFT token id from a fungible resource".to_string(),
@@ -854,6 +860,12 @@ impl ResourceContainer {
     }
 
     pub fn lock_by_amount(&mut self, amount: Amount) -> Result<Self, ResourceError> {
+        // A proof is accepted as possession of its resource, so it must lock a non-zero amount.
+        if amount.is_zero() {
+            return Err(ResourceError::OperationNotAllowed(
+                "A proof must lock a non-zero amount".to_string(),
+            ));
+        }
         match self {
             Self::Fungible {
                 amount: available_amount,

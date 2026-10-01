@@ -240,7 +240,8 @@ fn check_requirement<TStore: StateReader>(
             for proof_id in scope.proofs() {
                 let proof = state.get_proof(*proof_id)?;
 
-                if resx == proof.resource_address() {
+                // A resource rule requires possession, so the proof must hold some of the resource.
+                if resx == proof.resource_address() && !proof.is_empty() {
                     return Ok(true);
                 }
             }

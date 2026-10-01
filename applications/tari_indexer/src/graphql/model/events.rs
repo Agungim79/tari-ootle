@@ -30,7 +30,10 @@ use tari_ootle_common_types::displayable::Displayable;
 use tari_ootle_transaction::TransactionId;
 use tari_template_lib_types::ResourceAddress;
 
-use crate::{event_manager::EventManager, network_state_sync::EventFilter};
+use crate::{
+    event_manager::{EventManager, MAX_EVENT_QUERY_OFFSET},
+    network_state_sync::EventFilter,
+};
 
 const LOG_TARGET: &str = "tari::indexer::graphql::events";
 
@@ -73,6 +76,9 @@ pub struct EventQuery;
 
 #[Object]
 impl EventQuery {
+    /// Events newest first. A wildcard `topic` examines only the newest 10,000 events, so a short
+    /// or empty result does not mean the history holds no older match; page past that window with
+    /// REST `/transactions/events` and `before_id`.
     pub async fn get_events(
         &self,
         ctx: &Context<'_>,
@@ -100,12 +106,18 @@ impl EventQuery {
         if limit > 1000 {
             return Err(anyhow::anyhow!("Limit cannot be greater than 1000"));
         }
+        let offset = offset.unwrap_or(0);
+        if offset > MAX_EVENT_QUERY_OFFSET {
+            return Err(anyhow::anyhow!(
+                "Offset cannot be greater than {MAX_EVENT_QUERY_OFFSET}"
+            ));
+        }
         event_manager
             .get_events_from_db(
                 topic.as_deref(),
                 substate_id.as_ref(),
                 resource_address.as_ref(),
-                offset.unwrap_or(0),
+                offset,
                 limit,
             )
             .await?

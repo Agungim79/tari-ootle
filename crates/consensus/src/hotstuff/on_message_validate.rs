@@ -5,12 +5,10 @@ use std::collections::{HashSet, VecDeque};
 
 use log::*;
 use tari_consensus_types::BlockId;
-use tari_epoch_manager::EpochManagerReader;
 use tari_ootle_common_types::{
     Epoch,
     NodeHeight,
     committee::{Committee, CommitteeInfo},
-    optional::Optional,
 };
 use tari_ootle_storage::{
     StateStore,
@@ -493,21 +491,17 @@ impl<TConsensusSpec: ConsensusSpec> OnMessageValidate<TConsensusSpec> {
             });
         }
 
-        let Some(committee) = self
-            .epoch_manager
-            .get_committee_by_validator_public_key(msg.proposal.epoch(), msg.proposal.proposed_by())
-            .await
-            .optional()?
-        else {
-            warn!(
-                target: LOG_TARGET,
-                "❌ Foreign proposal block {} was proposed by {} who is not a registered validator for epoch {}. \
-                 Discarding message.",
-                msg.proposal,
-                msg.proposal.proposed_by(),
-                msg.proposal.epoch(),
-            );
-            return Ok(MessageValidationResult::Discard);
+        let committee = match validations::resolve_foreign_committee(&self.epoch_manager, &msg.proposal).await {
+            Ok(Some(committee)) => committee,
+            Ok(None) => return Ok(MessageValidationResult::Discard),
+            Err(HotStuffError::ProposalValidationError(err)) => {
+                return Ok(MessageValidationResult::Invalid {
+                    from,
+                    message: HotstuffMessage::ForeignProposal(msg),
+                    err: err.into(),
+                });
+            },
+            Err(err) => return Err(err),
         };
 
         if let Err(err) = self.check_foreign_proposal(&msg.proposal, &committee) {

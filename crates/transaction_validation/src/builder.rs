@@ -8,6 +8,7 @@ use crate::{
     BasicValidations,
     BlobReferenceValidator,
     EpochRangeValidator,
+    InputLimitValidator,
     InputsAreNotVirtualValidator,
     PublishTemplateLimitValidator,
     SignatureLimitValidator,
@@ -38,19 +39,31 @@ pub fn create_structural_transaction_validator(
     max_transaction_weight: u64,
     max_transaction_size_bytes: usize,
 ) -> impl Validator<Transaction, Context = (), Error = TransactionValidationError> {
+    create_dry_run_transaction_validator(network, max_transaction_weight, max_transaction_size_bytes)
+        .and_then(TransactionSignatureValidator)
+}
+
+/// Builds the structural validations for a dry-run: those of
+/// [`create_structural_transaction_validator`] except signature verification, since a dry-run is
+/// accepted with invalid signatures.
+pub fn create_dry_run_transaction_validator(
+    network: Network,
+    max_transaction_weight: u64,
+    max_transaction_size_bytes: usize,
+) -> impl Validator<Transaction, Context = (), Error = TransactionValidationError> {
     TransactionNetworkValidator::new(network)
         .and_then(BasicValidations::new())
         // Bytes before weight: the byte cap is what the gossip message limit is derived from, so a
         // transaction failing it could not have been relayed regardless of what it weighs.
         .and_then(TransactionSizeValidator::new(max_transaction_size_bytes))
         .and_then(BlobReferenceValidator::new())
+        .and_then(InputLimitValidator::new())
         .and_then(InputsAreNotVirtualValidator::new())
         .and_then(TransactionWeightValidator::new(max_transaction_weight))
         .and_then(StealthTransactionLimitsValidator::new())
         .and_then(PublishTemplateLimitValidator::new())
-        // Bounds the number of signature verifications the next validator performs.
+        // Bounds the number of signature verifications a submission goes on to perform.
         .and_then(SignatureLimitValidator::new())
-        .and_then(TransactionSignatureValidator)
 }
 
 /// Builds the validations an indexer runs against a transaction observed on the gossip topic before

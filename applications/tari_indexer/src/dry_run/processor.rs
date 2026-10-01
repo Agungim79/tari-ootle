@@ -36,6 +36,7 @@ use tari_ootle_common_types::SubstateRequirementRef;
 use tari_ootle_p2p::PeerAddress;
 use tari_ootle_template_provider::TemplateConfig;
 use tari_ootle_transaction::Transaction;
+use tari_ootle_transaction_validation::{Validator, create_dry_run_transaction_validator};
 use tari_template_lib_types::constants::TARI_TOKEN;
 use tokio::{runtime::Handle, task};
 
@@ -58,6 +59,8 @@ pub struct DryRunTransactionProcessor {
     template_provider: DryRunTemplateProvider,
     substate_manager: SubstateManager,
     claim_burn_proof_verifier: Arc<dyn ClaimProofVerifier + Send + Sync + 'static>,
+    max_transaction_weight: u64,
+    max_transaction_size_bytes: usize,
 }
 
 impl DryRunTransactionProcessor {
@@ -69,6 +72,8 @@ impl DryRunTransactionProcessor {
         wasm_cache: WasmModuleCache,
         template_config: &TemplateConfig,
         claim_burn_proof_verifier: impl ClaimProofVerifier + Send + Sync + 'static,
+        max_transaction_weight: u64,
+        max_transaction_size_bytes: usize,
     ) -> Result<Self, std::io::Error> {
         let handle = Handle::try_current().map_err(std::io::Error::other)?;
         let template_provider =
@@ -80,6 +85,8 @@ impl DryRunTransactionProcessor {
             template_provider,
             substate_manager,
             claim_burn_proof_verifier: Arc::new(claim_burn_proof_verifier),
+            max_transaction_weight,
+            max_transaction_size_bytes,
         })
     }
 
@@ -92,6 +99,13 @@ impl DryRunTransactionProcessor {
         }
 
         info!(target: LOG_TARGET, "process_transaction: {}", transaction.calculate_id());
+
+        create_dry_run_transaction_validator(
+            self.network,
+            self.max_transaction_weight,
+            self.max_transaction_size_bytes,
+        )
+        .validate(&(), &transaction)?;
 
         let mut found_substates = self.fetch_input_substates(&transaction).await?;
         // Add the TARI resource - this is what consensus does, so we'll need to do it for dry runs
@@ -135,7 +149,7 @@ impl DryRunTransactionProcessor {
     ) -> Result<HashMap<SubstateId, Substate>, DryRunTransactionProcessorError> {
         let substates = self
             .substate_manager
-            .get_substates(
+            .get_input_substates(
                 transaction
                     .inputs()
                     .iter()

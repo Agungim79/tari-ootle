@@ -4,11 +4,12 @@
 use log::*;
 use tari_consensus_types::{ProposalCertificate, Vote};
 use tari_epoch_manager::EpochManagerReader;
-use tari_ootle_common_types::{Epoch, NodeHeight, optional::Optional};
+use tari_ootle_common_types::{Epoch, NodeHeight, ShardGroup, optional::Optional};
 use tari_ootle_transaction::Network;
 
 use crate::{
     hotstuff::{
+        epoch_state::EpochState,
         error::HotStuffError,
         view_buffer::{View, ViewBuffer},
     },
@@ -19,7 +20,17 @@ use crate::{
 
 const LOG_TARGET: &str = "tari::ootle::consensus::hotstuff::inbound_messages";
 
-type IncomingMessageResult<TAddr> = Result<Option<(TAddr, HotstuffMessage)>, HotStuffError>;
+type IncomingMessageResult<TAddr> = Result<Option<InboundMessage<TAddr>>, HotStuffError>;
+
+/// What the message buffer hands to the consensus worker.
+pub enum InboundMessage<TAddr> {
+    /// A message for the current view.
+    Ready { from: TAddr, message: HotstuffMessage },
+    /// A committee member proposed on a certified block more than one view ahead of this node, in its epoch. The
+    /// blocks in between are missing here and no buffered proposal supplies them, so the node catches up now
+    /// instead of waiting out leader timeouts. The certificate's quorum signatures have been verified.
+    ProposalAhead { from: TAddr, justify: ProposalCertificate },
+}
 
 pub struct OnInboundMessage<TConsensusSpec: ConsensusSpec> {
     message_buffer: MessageBuffer<TConsensusSpec>,
@@ -44,20 +55,21 @@ impl<TConsensusSpec: ConsensusSpec> OnInboundMessage<TConsensusSpec> {
     /// can be used with tokio::select! macro.
     pub async fn next_message(
         &mut self,
-        current_epoch: Epoch,
+        epoch_state: &EpochState<TConsensusSpec::Addr>,
         current_height: NodeHeight,
         has_processed_first_block: bool,
-    ) -> Option<Result<(TConsensusSpec::Addr, HotstuffMessage), HotStuffError>> {
+    ) -> Option<Result<InboundMessage<TConsensusSpec::Addr>, HotStuffError>> {
         // Then incoming messages for the current epoch/height
         let result = self
             .message_buffer
-            .next(current_epoch, current_height, has_processed_first_block)
+            .next(epoch_state, current_height, has_processed_first_block)
             .await;
         match result {
-            Ok(Some((from, msg))) => {
-                self.hooks.on_message_received(&msg);
-                Some(Ok((from, msg)))
+            Ok(Some(InboundMessage::Ready { from, message })) => {
+                self.hooks.on_message_received(&message);
+                Some(Ok(InboundMessage::Ready { from, message }))
             },
+            Ok(Some(ahead @ InboundMessage::ProposalAhead { .. })) => Some(Ok(ahead)),
             Ok(None) => {
                 // Inbound messages terminated
                 None
@@ -106,6 +118,9 @@ const MAX_VIEW_LOOKAHEAD: NodeHeight = NodeHeight(20);
 pub struct MessageBuffer<TConsensusSpec: ConsensusSpec> {
     network: Network,
     buffer: ViewBuffer<(TConsensusSpec::Addr, HotstuffMessage)>,
+    /// The highest justify certificate already reported as [`InboundMessage::ProposalAhead`], so that each
+    /// certificate's signatures are checked and reported at most once.
+    highest_reported_ahead: Option<View>,
     inbound_messaging: TConsensusSpec::InboundMessaging,
     epoch_manager: TConsensusSpec::EpochManager,
     signer_service: TConsensusSpec::SignerService,
@@ -121,6 +136,7 @@ impl<TConsensusSpec: ConsensusSpec> MessageBuffer<TConsensusSpec> {
         Self {
             network,
             buffer: ViewBuffer::new(MAX_BUFFERED_MESSAGES, MAX_BUFFERED_BYTES),
+            highest_reported_ahead: None,
             inbound_messaging,
             epoch_manager,
             signer_service,
@@ -129,10 +145,11 @@ impl<TConsensusSpec: ConsensusSpec> MessageBuffer<TConsensusSpec> {
 
     pub async fn next(
         &mut self,
-        current_epoch: Epoch,
+        epoch_state: &EpochState<TConsensusSpec::Addr>,
         current_height: NodeHeight,
         has_processed_first_block: bool,
     ) -> IncomingMessageResult<TConsensusSpec::Addr> {
+        let current_epoch = epoch_state.epoch();
         let next_view = View::new(current_epoch, current_height + NodeHeight(1));
         // Clear buffer with lower (epoch, heights)
         let num_discarded = self.buffer.discard_before(next_view);
@@ -148,8 +165,8 @@ impl<TConsensusSpec: ConsensusSpec> MessageBuffer<TConsensusSpec> {
         );
         if has_processed_first_block {
             // Drain all buffered messages for the current view
-            if let Some(msg_tuple) = self.buffer.pop_front(&next_view) {
-                return Ok(Some(msg_tuple));
+            if let Some((from, message)) = self.buffer.pop_front(&next_view) {
+                return Ok(Some(InboundMessage::Ready { from, message }));
             }
         }
 
@@ -191,7 +208,7 @@ impl<TConsensusSpec: ConsensusSpec> MessageBuffer<TConsensusSpec> {
 
             match msg_relative_view(&msg, current_epoch, current_height, has_processed_first_block) {
                 MessageRelativeView::Current => {
-                    return Ok(Some((from, msg)));
+                    return Ok(Some(InboundMessage::Ready { from, message: msg }));
                 },
                 MessageRelativeView::Past { epoch, height } => {
                     info!(target: LOG_TARGET, "🗑️ Discard message {} is for previous view {}/{}. Current view {}/{}", msg, epoch, height, current_epoch, current_height);
@@ -202,7 +219,17 @@ impl<TConsensusSpec: ConsensusSpec> MessageBuffer<TConsensusSpec> {
                     } else {
                         info!(target: LOG_TARGET, "🔮 Message {msg} is for future view {height} (Current view: {current_epoch}, {current_height})");
                     }
-                    self.push_to_buffer(View::new(current_epoch, current_height), epoch, height, from, msg);
+                    let justify_ahead = self.verified_justify_ahead(&from, &msg, epoch_state, current_height);
+                    self.push_to_buffer(
+                        View::new(current_epoch, current_height),
+                        epoch,
+                        height,
+                        from.clone(),
+                        msg,
+                    );
+                    if let Some(justify) = justify_ahead {
+                        return Ok(Some(InboundMessage::ProposalAhead { from, justify }));
+                    }
                 },
                 MessageRelativeView::Discard => {
                     warn!(target: LOG_TARGET, "🗑️ Discard non-applicable message {}. Current view {}/{}", msg, current_epoch, current_height);
@@ -225,6 +252,54 @@ impl<TConsensusSpec: ConsensusSpec> MessageBuffer<TConsensusSpec> {
 
     pub fn clear_buffer(&mut self) {
         self.buffer.clear();
+        self.highest_reported_ahead = None;
+    }
+
+    /// Returns a proposal's justify certificate when a member of our committee sends it, it certifies a block on
+    /// our own chain more than one view ahead of ours, its quorum signatures verify against our committee, and it is
+    /// higher than any certificate already reported.
+    fn verified_justify_ahead(
+        &mut self,
+        from: &TConsensusSpec::Addr,
+        msg: &HotstuffMessage,
+        epoch_state: &EpochState<TConsensusSpec::Addr>,
+        current_height: NodeHeight,
+    ) -> Option<ProposalCertificate> {
+        let HotstuffMessage::Proposal(proposal) = msg else {
+            return None;
+        };
+        let justify = proposal.block.justify();
+        // Both gates run before the dedupe, so a certificate from another shard group's chain or a non-member
+        // cannot raise `highest_reported_ahead` and mask reports from our own chain.
+        if !is_own_chain_ahead(
+            justify,
+            epoch_state.epoch(),
+            epoch_state.local_committee_info().shard_group(),
+            current_height,
+        ) || !epoch_state.local_committee().contains(from)
+        {
+            return None;
+        }
+        let view = View::new(justify.epoch(), justify.height());
+        if self.highest_reported_ahead.is_some_and(|reported| view <= reported) {
+            return None;
+        }
+        if let Err(err) = check_quorum_certificate_signatures::<TConsensusSpec>(
+            self.network,
+            justify.into(),
+            epoch_state.local_committee(),
+            &self.signer_service,
+        ) {
+            debug!(
+                target: LOG_TARGET,
+                "Ignoring proposal from {from} justified by {}/{}: signature check failed ({err})",
+                justify.epoch(),
+                justify.height()
+            );
+            return None;
+        }
+        self.highest_reported_ahead = Some(view);
+        Some(justify.clone())
     }
 
     /// Returns `Some(reason)` if `msg` carries a 2f+1-signed QC for an epoch strictly ahead of
@@ -360,6 +435,20 @@ impl<TConsensusSpec: ConsensusSpec> MessageBuffer<TConsensusSpec> {
             },
         }
     }
+}
+
+/// True when `justify` certifies a block on our own chain (our epoch and shard group) more than one view ahead of
+/// `current_height`, so the blocks between are missing here. Other shard groups run their own chains, whose heights
+/// say nothing about ours.
+fn is_own_chain_ahead(
+    justify: &ProposalCertificate,
+    local_epoch: Epoch,
+    local_shard_group: ShardGroup,
+    current_height: NodeHeight,
+) -> bool {
+    justify.epoch() == local_epoch &&
+        justify.shard_group() == local_shard_group &&
+        justify.height() > current_height + NodeHeight(1)
 }
 
 /// Whether `view` is too far ahead of `current_view` to be worth holding. Views in a later epoch are always
@@ -587,6 +676,71 @@ fn msg_relative_view(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    mod is_own_chain_ahead {
+        use tari_common_types::types::FixedHash;
+        use tari_consensus_types::BlockId;
+        use tari_sidechain::QuorumDecision;
+
+        use super::*;
+
+        fn local_group() -> ShardGroup {
+            ShardGroup::new_checked(0, 127).unwrap()
+        }
+
+        fn justify(epoch: u64, shard_group: ShardGroup, height: u64) -> ProposalCertificate {
+            ProposalCertificate::new(
+                FixedHash::zero(),
+                BlockId::zero(),
+                NodeHeight(height),
+                Epoch(epoch),
+                shard_group,
+                vec![],
+                QuorumDecision::Accept,
+            )
+        }
+
+        #[test]
+        fn a_certificate_on_our_chain_two_views_ahead_is_ahead() {
+            assert!(is_own_chain_ahead(
+                &justify(1, local_group(), 12),
+                Epoch(1),
+                local_group(),
+                NodeHeight(10)
+            ));
+        }
+
+        #[test]
+        fn a_certificate_for_the_next_view_is_not_ahead() {
+            assert!(!is_own_chain_ahead(
+                &justify(1, local_group(), 11),
+                Epoch(1),
+                local_group(),
+                NodeHeight(10)
+            ));
+        }
+
+        #[test]
+        fn a_certificate_from_another_shard_group_is_not_ahead() {
+            let other_group = ShardGroup::new_checked(128, 255).unwrap();
+            assert!(!is_own_chain_ahead(
+                &justify(1, other_group, 100),
+                Epoch(1),
+                local_group(),
+                NodeHeight(10)
+            ));
+        }
+
+        #[test]
+        fn a_certificate_from_another_epoch_is_not_ahead() {
+            assert!(!is_own_chain_ahead(
+                &justify(2, local_group(), 100),
+                Epoch(1),
+                local_group(),
+                NodeHeight(10)
+            ));
+        }
+    }
 
     mod exceeds_view_lookahead {
         use super::*;

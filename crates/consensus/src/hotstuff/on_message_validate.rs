@@ -5,6 +5,7 @@ use std::collections::{HashSet, VecDeque};
 
 use log::*;
 use tari_consensus_types::BlockId;
+use tari_epoch_manager::EpochManagerReader;
 use tari_ootle_common_types::{
     Epoch,
     NodeHeight,
@@ -31,6 +32,7 @@ use crate::{
     },
     messages::{
         ForeignProposalMessage,
+        ForeignProposalRequestMessage,
         HotstuffMessage,
         MAX_REQUESTED_TRANSACTIONS,
         MissingTransactionsRequest,
@@ -149,6 +151,12 @@ impl<TConsensusSpec: ConsensusSpec> OnMessageValidate<TConsensusSpec> {
                 })
             },
             HotstuffMessage::MissingTransactionsRequest(msg) => {
+                if !self
+                    .is_missing_transactions_requester(epoch_state, &from, msg.epoch)
+                    .await?
+                {
+                    return Ok(MessageValidationResult::Discard);
+                }
                 if msg.transactions.len() > MAX_REQUESTED_TRANSACTIONS {
                     warn!(target: LOG_TARGET, "⚠️Peer requested more than the maximum amount of transactions. Discarding message");
                     return Ok(MessageValidationResult::Discard);
@@ -156,6 +164,15 @@ impl<TConsensusSpec: ConsensusSpec> OnMessageValidate<TConsensusSpec> {
                 Ok(MessageValidationResult::Ready {
                     from,
                     message: HotstuffMessage::MissingTransactionsRequest(msg),
+                })
+            },
+            HotstuffMessage::ForeignProposalRequest(msg) => {
+                if !self.is_foreign_proposal_requester(epoch_state, &from, &msg).await? {
+                    return Ok(MessageValidationResult::Discard);
+                }
+                Ok(MessageValidationResult::Ready {
+                    from,
+                    message: HotstuffMessage::ForeignProposalRequest(msg),
                 })
             },
             msg @ HotstuffMessage::NewView(_) |
@@ -174,6 +191,92 @@ impl<TConsensusSpec: ConsensusSpec> OnMessageValidate<TConsensusSpec> {
             },
             msg => Ok(MessageValidationResult::Ready { from, message: msg }),
         }
+    }
+
+    /// Local committee members request transactions for local proposals and foreign committee members for foreign
+    /// proposals, so any validator registered for the request's epoch may ask.
+    async fn is_missing_transactions_requester(
+        &self,
+        epoch_state: &EpochState<TConsensusSpec::Addr>,
+        from: &TConsensusSpec::Addr,
+        epoch: Epoch,
+    ) -> Result<bool, HotStuffError> {
+        if epoch_state.local_committee().contains(from) {
+            return Ok(true);
+        }
+
+        // The epoch is chosen by the requester, so a failed lookup rejects the request rather than the worker.
+        match self
+            .epoch_manager
+            .get_committee_info_by_validator_address(epoch, from)
+            .await
+        {
+            Ok(_) => Ok(true),
+            Err(err) => {
+                warn!(
+                    target: LOG_TARGET,
+                    "❌ Received MissingTransactionsRequest from {from} who is not a registered validator for epoch \
+                     {epoch} ({err}). Discarding message.",
+                );
+                Ok(false)
+            },
+        }
+    }
+
+    /// A foreign proposal is only served to a registered validator that is a member of the foreign shard group it asks
+    /// pledges for.
+    async fn is_foreign_proposal_requester(
+        &self,
+        epoch_state: &EpochState<TConsensusSpec::Addr>,
+        from: &TConsensusSpec::Addr,
+        msg: &ForeignProposalRequestMessage,
+    ) -> Result<bool, HotStuffError> {
+        let ForeignProposalRequestMessage::ByBlockId {
+            for_shard_group, epoch, ..
+        } = msg;
+
+        if *for_shard_group == epoch_state.local_committee_info().shard_group() {
+            warn!(
+                target: LOG_TARGET,
+                "❌ Received ForeignProposalRequest from {from} for the local shard group {for_shard_group}. Discarding message.",
+            );
+            return Ok(false);
+        }
+
+        // `for_shard_group` is the requester's shard group in its own current epoch, which may be one either side of
+        // ours across a boundary, and shard groups move between epochs when the committee count changes. The epoch is
+        // chosen by the requester, so a failed lookup counts as no match.
+        let current_epoch = epoch_state.epoch();
+        let mut candidate_epochs = vec![current_epoch];
+        for candidate in [
+            Some(*epoch),
+            Some(current_epoch + Epoch(1)),
+            current_epoch.checked_sub(Epoch(1)),
+        ]
+        .into_iter()
+        .flatten()
+        {
+            if !candidate_epochs.contains(&candidate) {
+                candidate_epochs.push(candidate);
+            }
+        }
+        for candidate in candidate_epochs {
+            if let Ok(requester) = self
+                .epoch_manager
+                .get_committee_info_by_validator_address(candidate, from)
+                .await &&
+                requester.shard_group() == *for_shard_group
+            {
+                return Ok(true);
+            }
+        }
+
+        warn!(
+            target: LOG_TARGET,
+            "❌ Received ForeignProposalRequest from {from} who is not a member of shard group {for_shard_group} in or \
+             around epoch {current_epoch} (requested epoch {epoch}). Discarding message.",
+        );
+        Ok(false)
     }
 
     pub async fn request_missing_transactions(

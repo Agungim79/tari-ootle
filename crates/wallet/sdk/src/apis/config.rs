@@ -67,8 +67,8 @@ pub enum ConfigKey {
     Network,
     /// The cipher seed used to encrypt the wallet. type: Vec<u8>
     CipherSeed,
-    /// The URL of the indexer. type: String
-    IndexerUrl,
+    /// The indexer URLs the wallet may use. type: Vec<Url>, or a single Url as stored by earlier versions
+    IndexerUrls,
     /// Indicates whether the wallet needs to be recovered. type: bool
     RecoveryNeeded,
     /// The keyring key that stored the decryption password
@@ -86,7 +86,7 @@ impl ConfigKey {
         match self {
             Self::Network => "network",
             Self::CipherSeed => "cipher_seed",
-            Self::IndexerUrl => "indexer_url",
+            Self::IndexerUrls => "indexer_url",
             Self::RecoveryNeeded => "recovery_needed",
             Self::KeyringPasswordEntryKey => "keyring_password_entry_key",
             Self::AdvancedUiFeatures => "advanced_ui_features",

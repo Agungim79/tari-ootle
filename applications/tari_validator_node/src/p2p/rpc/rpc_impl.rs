@@ -95,7 +95,7 @@ use crate::{
         rpc::{
             CONSENSUS_NOT_RUNNING,
             block_sync_task::BlockSyncTask,
-            state_sync_task::{HeldHistory, ShardCursor, StateSyncTask, TipAuthority},
+            state_sync_task::{HeldHistory, ShardCursor, StateSyncTask, TipAuthority, ensure_epoch_reached},
         },
         services::mempool::MempoolHandle,
     },
@@ -138,8 +138,11 @@ impl<TStateStore: StateStore> ValidatorNodeRpcServiceImpl<TStateStore> {
             .map(|checkpoint| checkpoint.checked_shard_group())
             .collect::<Result<Vec<_>, _>>()
             .map_err(RpcStatus::log_internal_error(LOG_TARGET))?;
+        let next_epoch = epoch
+            .checked_add(Epoch(1))
+            .ok_or_else(|| RpcStatus::bad_request(format!("No epoch follows {epoch}")))?;
         let committed_as = self.local_shard_group_at(epoch).await?;
-        let synced_as = self.local_shard_group_at(epoch + Epoch(1)).await?;
+        let synced_as = self.local_shard_group_at(next_epoch).await?;
         Ok(HeldHistory {
             checkpoint_shard_groups,
             committed_as,
@@ -666,6 +669,12 @@ impl<TStateStore: StateStore + Clone + Send + Sync + 'static> ValidatorNodeRpcSe
         // marker names the epoch its claim is made as of, so the claim and the marker must be anchored
         // to the same one.
         let tip_authority = if let Some(end_epoch) = end_epoch {
+            let current_epoch = self
+                .epoch_manager
+                .current_epoch()
+                .await
+                .map_err(RpcStatus::log_internal_error(LOG_TARGET))?;
+            ensure_epoch_reached(end_epoch, current_epoch)?;
             self.held_history(end_epoch)
                 .await?
                 .ensure_holds_all(&cursors, end_epoch)?;

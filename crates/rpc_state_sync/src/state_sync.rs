@@ -7,7 +7,6 @@ use std::{
 };
 
 use anyhow::anyhow;
-use futures::StreamExt;
 use log::*;
 use ootle_network::Network;
 use rand::seq::SliceRandom;
@@ -19,8 +18,8 @@ use tari_consensus_types::{LeafBlock, ProposalCertificate};
 use tari_epoch_manager::EpochManagerReader;
 use tari_ootle_common_types::{
     Epoch,
+    NumPreshards,
     ShardGroup,
-    VersionedSubstateId,
     VotePower,
     committee::{Committee, CommitteeMember},
     optional::Optional,
@@ -28,42 +27,26 @@ use tari_ootle_common_types::{
 };
 use tari_ootle_p2p::{
     PeerAddress,
-    proto::rpc::{
-        GetCheckpointsRequest,
-        GetCheckpointsResponse,
-        GetHighQcRequest,
-        ShardCursor,
-        SyncStateRequest,
-        sync_state_response,
-    },
+    proto::rpc::{GetCheckpointsRequest, GetCheckpointsResponse, GetHighQcRequest, ShardCursor, SyncStateRequest},
 };
 use tari_ootle_storage::{
-    ShardScopedTreeStoreReader,
-    ShardScopedTreeStoreWriter,
     StateStore,
     StateStoreReadTransaction,
-    StateStoreWriteTransaction,
-    StorageError,
-    consensus_models::{
-        BookkeepingEpochAgnosticRead,
-        EpochCheckpoint,
-        SubstateRecord,
-        SubstateTransition,
-        SubstateUpdateBatch,
-        SubstateUpdateProof,
-        SubstateValueFilterFlags,
-    },
+    consensus_models::{BookkeepingEpochAgnosticRead, EpochCheckpoint, SubstateValueFilterFlags},
 };
 use tari_rpc_framework::RpcError;
-use tari_state_tree::{SPARSE_MERKLE_PLACEHOLDER_HASH, SpreadPrefixStateTree, SubstateTreeChange, TreeHash, Version};
+use tari_state_tree::Version;
 use tari_template_lib_types::crypto::RistrettoPublicKeyBytes;
 use tari_validator_node_rpc::{
-    STATE_SYNC_MAX_BATCH_SIZE,
     client::{TariValidatorNodeRpcClientFactory, ValidatorNodeClientFactory},
     rpc_service::ValidatorNodeRpcClient,
 };
 
-use crate::{error::RpcStateSyncError, stats::StateSyncStats};
+use crate::{
+    error::RpcStateSyncError,
+    shard_sync::{ShardSync, calculate_state_root_for_shard, discard_all_unverified_state},
+    stats::StateSyncStats,
+};
 
 const LOG_TARGET: &str = "tari::ootle::rpc_state_sync";
 
@@ -172,20 +155,24 @@ where TConsensusSpec: ConsensusSpec<Addr = PeerAddress>
         Ok(Some(checkpoint))
     }
 
-    #[allow(clippy::too_many_lines)]
     async fn start_state_sync(
         &mut self,
         client: &mut ValidatorNodeRpcClient,
         shard: Shard,
+        num_preshards: NumPreshards,
         checkpoint: &EpochCheckpoint,
-        mut maybe_persisted_state_version: Option<Version>,
     ) -> Result<Option<Version>, RpcStateSyncError> {
         let checkpoint_shard_root = checkpoint.get_shard_root(shard);
+        let shard_sync = ShardSync::new(
+            self.network,
+            num_preshards,
+            &self.state_store,
+            shard,
+            checkpoint_shard_root,
+        );
+        let maybe_persisted_state_version = shard_sync.discard_unverified_state()?;
 
-        let initial_local_state_root = self
-            .state_store
-            .with_read_tx(|tx| self.calculate_state_root_for_shard(tx, shard, maybe_persisted_state_version))?;
-        if checkpoint_shard_root == initial_local_state_root {
+        if shard_sync.local_state_root(maybe_persisted_state_version)? == checkpoint_shard_root {
             info!(target: LOG_TARGET, "Checkpoint state root indicates no further state changes. Nothing to sync for {shard}");
             return Ok(None);
         }
@@ -198,14 +185,13 @@ where TConsensusSpec: ConsensusSpec<Addr = PeerAddress>
         // every node bootstraps it - so a freshly bootstrapped node starts at version 1, which is also
         // the minimum the peer accepts.
         let start_state_version = maybe_persisted_state_version.map_or(1, |v| v + 1);
-        let mut last_state_version = start_state_version;
         info!(
             target: LOG_TARGET,
             "🛜Syncing from v{start_state_version}",
         );
 
         self.stats.total_requests += 1;
-        let mut state_stream = client
+        let state_stream = client
             .sync_state(SyncStateRequest {
                 cursors: vec![ShardCursor {
                     shard: shard.as_u32(),
@@ -217,186 +203,9 @@ where TConsensusSpec: ConsensusSpec<Addr = PeerAddress>
             })
             .await?;
 
-        let mut tree_changes = vec![];
-        let mut updates = vec![];
-        let mut expected_state_version = None;
-
-        // syncing states
-        while let Some(result) = state_stream.next().await {
-            let msg = result?;
-            let batch = match msg.response {
-                Some(sync_state_response::Response::Batch(batch)) => batch,
-                Some(sync_state_response::Response::Complete(complete)) => {
-                    if complete.shard != shard.as_u32() {
-                        return Err(RpcStateSyncError::InvalidResponse(anyhow!(
-                            "Received completion marker for shard {} but requested {shard}",
-                            complete.shard,
-                        )));
-                    }
-                    // The stream always terminates with a completion marker. Verify the synced shard
-                    // root against the trusted checkpoint at our last committed version: the producer
-                    // streamed every transition up to the checkpoint epoch, so any gap to
-                    // checkpoint_state_version is tree-only (no substate change) and the root at our
-                    // last written version equals the checkpoint root. The marker's own version is the
-                    // producer's claim and is not trusted as the verification target.
-                    debug!(
-                        target: LOG_TARGET,
-                        "🛜 Stream complete for {shard} (peer reported v{}, locally committed v{})",
-                        complete.synced_to_version,
-                        maybe_persisted_state_version.unwrap_or(0),
-                    );
-                    let local_state_root = self.state_store.with_read_tx(|tx| {
-                        self.calculate_state_root_for_shard(tx, shard, maybe_persisted_state_version)
-                    })?;
-                    if local_state_root != checkpoint_shard_root {
-                        error!(
-                            target: LOG_TARGET,
-                            "❌ State root mismatch for {shard}. Checkpoint {expected} but got {actual}. Everything \
-                             streamed so far is already committed; the next peer resumes after it.",
-                            expected = checkpoint_shard_root,
-                            actual = local_state_root,
-                        );
-                        return Err(RpcStateSyncError::StateRootMismatch {
-                            expected: checkpoint_shard_root,
-                            actual: local_state_root,
-                        });
-                    }
-                    info!(
-                        target: LOG_TARGET,
-                        "🛜 ✅ State root for {shard} matches checkpoint: {local_state_root} (v{})",
-                        maybe_persisted_state_version.unwrap_or(0),
-                    );
-                    return Ok(maybe_persisted_state_version);
-                },
-                None => {
-                    return Err(RpcStateSyncError::InvalidResponse(anyhow!(
-                        "Received sync state response with no variant set."
-                    )));
-                },
-            };
-
-            if batch.shard != shard.as_u32() {
-                return Err(RpcStateSyncError::InvalidResponse(anyhow!(
-                    "Received batch for shard {} but requested {shard}",
-                    batch.shard,
-                )));
-            }
-            if batch.updates.is_empty() {
-                return Err(RpcStateSyncError::InvalidResponse(anyhow!(
-                    "Received empty state transition batch."
-                )));
-            }
-            if batch.updates.len() > STATE_SYNC_MAX_BATCH_SIZE {
-                return Err(RpcStateSyncError::InvalidResponse(anyhow!(
-                    "Received too many state updates in a batch: {}. Expected at most {}.",
-                    batch.updates.len(),
-                    STATE_SYNC_MAX_BATCH_SIZE
-                )));
-            }
-            if batch.state_version < start_state_version {
-                return Err(RpcStateSyncError::InvalidResponse(anyhow!(
-                    "Received state version {} that is less than the persisted state version {}.",
-                    batch.state_version,
-                    start_state_version
-                )));
-            }
-
-            if expected_state_version.is_some_and(|v| v != batch.state_version) {
-                return Err(RpcStateSyncError::InvalidResponse(anyhow!(
-                    "Received state version {} that is not the expected state version {}.",
-                    batch.state_version,
-                    expected_state_version.unwrap()
-                )));
-            }
-
-            let state_version = batch.state_version;
-            if state_version < last_state_version {
-                return Err(RpcStateSyncError::InvalidResponse(anyhow!(
-                    "Received state version {} that is less than the last state version {}.",
-                    state_version,
-                    last_state_version
-                )));
-            }
-
-            last_state_version = state_version;
-
-            self.stats.total_transitions += batch.updates.len() as u64;
-
-            tree_changes.reserve_exact(batch.updates.len());
-            updates.reserve_exact(batch.updates.len());
-
-            let updates_for_state_version = batch
-                .updates
-                .into_iter()
-                .map(|t| SubstateUpdateProof::try_from(t).map_err(RpcStateSyncError::InvalidResponse));
-            let msg_epoch = batch.epoch.map(Epoch::from).ok_or_else(|| {
-                RpcStateSyncError::InvalidResponse(anyhow!("Received state transition with no epoch"))
-            })?;
-
-            info!(target: LOG_TARGET, "🛜 Buffering {} state update(s) (state version: v{})", updates_for_state_version.len(), state_version);
-            for result in updates_for_state_version {
-                let update = result?;
-                let tree_change = extract_tree_change(self.network, &update, msg_epoch)?;
-
-                debug!(target: LOG_TARGET, "🛜 -> state update (v{}) {}", state_version, update);
-                tree_changes.push(tree_change);
-                updates.push(update);
-            }
-
-            info!(target: LOG_TARGET, "🛜 Sync: {} state update(s), state version: v{}", updates.len(), state_version);
-
-            if batch.has_more {
-                info!(
-                    target: LOG_TARGET,
-                    "🛜 Received more state updates for v{}. Continuing to buffer...",
-                    state_version
-                );
-                // Continue buffering
-                // TODO: maximum possible state transitions within a single state version?
-                expected_state_version = Some(state_version);
-                continue;
-            }
-
-            expected_state_version = None;
-
-            // Commit the buffered changes for this state version. The shard root is verified once, on
-            // the terminal SyncComplete, against the trusted checkpoint.
-            self.state_store.with_write_tx(|tx| {
-                info!(
-                    target: LOG_TARGET,
-                    "🛜 Next state updates batch of size {} from v{}",
-                    updates.len(),
-                    state_version
-                );
-
-                let mut store = ShardScopedTreeStoreWriter::new(tx, shard);
-
-                info!(target: LOG_TARGET, "🛜 {} state update(s) for v{}", updates.len(), state_version);
-                self.commit_updates(
-                    store.transaction(),
-                    shard,
-                    msg_epoch,
-                    state_version,
-                    updates.drain(..),
-                )?;
-
-                // Persist tree changes
-                if !tree_changes.is_empty() {
-                    let mut state_tree = SpreadPrefixStateTree::new(&mut store);
-                    info!(target: LOG_TARGET, "🛜 Committing {} state tree changes batch v{}", tree_changes.len(), state_version);
-                    state_tree.batch_put_substate_changes(maybe_persisted_state_version, state_version, tree_changes.drain(..))?;
-                    maybe_persisted_state_version = Some(state_version);
-                    store.set_state_version(state_version)?;
-                }
-
-                Ok::<_, RpcStateSyncError>(())
-            })?;
-        }
-
-        // The stream ended without a SyncComplete - the peer closed early, so the sync is unverified.
-        Err(RpcStateSyncError::InvalidResponse(anyhow!(
-            "State sync stream for {shard} ended without a completion marker"
-        )))
+        shard_sync
+            .sync_from_stream(&mut self.stats, maybe_persisted_state_version, state_stream)
+            .await
     }
 
     /// True if this node's committed state already matches `checkpoint` for every shard it is responsible for (its
@@ -408,56 +217,13 @@ where TConsensusSpec: ConsensusSpec<Addr = PeerAddress>
         self.state_store.with_read_tx(|tx| {
             for shard in local_info.shard_group().shard_iter_with_global() {
                 let version = tx.state_tree_versions_get_latest(shard)?;
-                let local_root = self.calculate_state_root_for_shard(tx, shard, version)?;
+                let local_root = calculate_state_root_for_shard(tx, shard, version)?;
                 if local_root != checkpoint.get_shard_root(shard) {
                     return Ok(false);
                 }
             }
             Ok(true)
         })
-    }
-
-    fn calculate_state_root_for_shard(
-        &self,
-        tx: &<TConsensusSpec::StateStore as StateStore>::ReadTransaction<'_>,
-        shard: Shard,
-        version: Option<Version>,
-    ) -> Result<TreeHash, RpcStateSyncError> {
-        let Some(version) = version else {
-            return Ok(SPARSE_MERKLE_PLACEHOLDER_HASH);
-        };
-        let mut store = ShardScopedTreeStoreReader::new(tx, shard);
-        let state_tree = SpreadPrefixStateTree::new(&mut store);
-        let root = state_tree.get_root_hash(version)?;
-        Ok(root)
-    }
-
-    pub fn commit_updates<TTx: StateStoreWriteTransaction, I: IntoIterator<Item = SubstateUpdateProof>>(
-        &self,
-        tx: &mut TTx,
-        shard: Shard,
-        epoch: Epoch,
-        state_version: Version,
-        updates: I,
-    ) -> Result<(), StorageError> {
-        let mut batch = SubstateUpdateBatch::new(self.network, epoch);
-
-        batch
-            .with_transition(shard, state_version)
-            .extend(updates.into_iter().map(|update| match update {
-                SubstateUpdateProof::Create(create) => SubstateTransition::Up {
-                    id: create.substate.substate_id,
-                    version: create.substate.version,
-                    substate_or_hash: create.substate.value,
-                },
-                SubstateUpdateProof::Destroy(destroy) => SubstateTransition::Down {
-                    id: VersionedSubstateId::new(destroy.substate_id, destroy.version),
-                },
-            }));
-
-        SubstateRecord::commit_batch(tx, batch)?;
-
-        Ok(())
     }
 
     async fn get_sync_sources(
@@ -528,6 +294,7 @@ where TConsensusSpec: ConsensusSpec<Addr = PeerAddress>
         shard: Shard,
         shard_group: ShardGroup,
         epoch: Epoch,
+        num_preshards: NumPreshards,
         source: &SyncSource,
     ) -> Result<Option<Version>, RpcStateSyncError> {
         let prev_epoch = epoch
@@ -586,12 +353,8 @@ where TConsensusSpec: ConsensusSpec<Addr = PeerAddress>
                 },
             };
 
-            let maybe_persisted_state_version = self
-                .state_store
-                .with_read_tx(|tx| tx.state_tree_versions_get_latest(shard))?;
-
             match self
-                .start_state_sync(&mut client, shard, &checkpoint, maybe_persisted_state_version)
+                .start_state_sync(&mut client, shard, num_preshards, &checkpoint)
                 .await
             {
                 Ok(maybe_version) => {
@@ -633,6 +396,7 @@ where TConsensusSpec: ConsensusSpec<Addr = PeerAddress>
     async fn sync_global_shard(
         &mut self,
         current_epoch: Epoch,
+        num_preshards: NumPreshards,
         sources: &HashMap<ShardGroup, SyncSource>,
     ) -> Result<Option<Version>, RpcStateSyncError> {
         let mut last_error = None;
@@ -640,7 +404,9 @@ where TConsensusSpec: ConsensusSpec<Addr = PeerAddress>
         for (sg, source) in sources {
             // Any previous-epoch checkpoint carries the global shard root, so the first shard group to succeed
             // justifies the whole global shard sync.
-            let result = self.sync_shard(Shard::global(), *sg, current_epoch, source).await;
+            let result = self
+                .sync_shard(Shard::global(), *sg, current_epoch, num_preshards, source)
+                .await;
             match result {
                 Ok(maybe_version) => {
                     let Some(version) = maybe_version else {
@@ -672,6 +438,7 @@ where TConsensusSpec: ConsensusSpec<Addr = PeerAddress>
     async fn sync_inner(&mut self, target_epoch: Option<Epoch>) -> Result<(), RpcStateSyncError> {
         let timer = Instant::now();
         self.unsaved_checkpoints.clear();
+        discard_all_unverified_state(&self.state_store)?;
         // Use the caller-provided target if any (typically the highest epoch resolved by a
         // stall-recovery probe), otherwise fall back to the oracle's current epoch.
         let current_epoch = match target_epoch {
@@ -713,8 +480,10 @@ where TConsensusSpec: ConsensusSpec<Addr = PeerAddress>
         }
 
         let local_shard_group = local_info.shard_group();
+        let num_preshards = local_info.num_preshards();
 
-        self.sync_global_shard(current_epoch, &sync_sources).await?;
+        self.sync_global_shard(current_epoch, num_preshards, &sync_sources)
+            .await?;
 
         // Sync data from each committee in range of the committee we're joining.
         // NOTE: we don't have to worry about substates in address range because shard boundaries are fixed.
@@ -727,7 +496,8 @@ where TConsensusSpec: ConsensusSpec<Addr = PeerAddress>
                 continue;
             };
             for shard in intersect_shard_group.shard_iter() {
-                self.sync_shard(shard, shard_group, current_epoch, &source).await?;
+                self.sync_shard(shard, shard_group, current_epoch, num_preshards, &source)
+                    .await?;
             }
             // The global shard synced first, so every shard this node takes from the checkpoint now matches it.
             if let Some(checkpoint) = self.unsaved_checkpoints.remove(&shard_group) {
@@ -987,6 +757,11 @@ where TConsensusSpec: ConsensusSpec<Addr = PeerAddress> + Send + Sync + 'static
     type Error = RpcStateSyncError;
 
     async fn check_sync(&self) -> Result<SyncStatus, Self::Error> {
+        // Every path to `Running` passes through here or through `sync`, so consensus never starts on top of state
+        // an interrupted sync left unverified, and the stale-node GC never runs while such state could still be
+        // rewound.
+        discard_all_unverified_state(&self.state_store)?;
+
         if self.skip_sync {
             warn!(target: LOG_TARGET, "🛜 State sync is disabled (--skip-sync). Reporting as up to date without checking.");
             return Ok(SyncStatus::UpToDate);
@@ -1136,25 +911,6 @@ where TConsensusSpec: ConsensusSpec<Addr = PeerAddress> + Send + Sync + 'static
 
         self.stats = StateSyncStats::default();
         Ok(())
-    }
-}
-
-fn extract_tree_change(
-    network: Network,
-    update: &SubstateUpdateProof,
-    epoch: Epoch,
-) -> Result<SubstateTreeChange, RpcStateSyncError> {
-    match update {
-        SubstateUpdateProof::Create(create) => {
-            let id = create.substate.as_versioned_substate_id_ref();
-            Ok(SubstateTreeChange::Up {
-                id: id.to_owned(),
-                value_hash: create.substate.to_value_hash(network, epoch),
-            })
-        },
-        SubstateUpdateProof::Destroy(destroy) => Ok(SubstateTreeChange::Down {
-            id: destroy.to_versioned_substate_id(),
-        }),
     }
 }
 

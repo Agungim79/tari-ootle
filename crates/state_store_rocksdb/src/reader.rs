@@ -135,6 +135,7 @@ use crate::{
         lock_conflict,
         parked_block,
         pending_state_tree_diff,
+        state_sync_rewind_point::StateSyncRewindPointCf,
         state_transition,
         state_transition::StateTransitionType,
         state_tree,
@@ -1965,6 +1966,26 @@ impl<'tx, TAddr: NodeAddressable + Serialize + DeserializeOwned + 'tx, R: RocksR
         let cf = self.db().cf(StateTreeShardVersionCf)?;
         let version = cf.get(&shard, OPERATION).optional()?;
         Ok(version)
+    }
+
+    fn state_sync_rewind_point_get(&self, shard: Shard) -> Result<Option<Version>, StorageError> {
+        const OPERATION: &str = "state_sync_rewind_point_get";
+        let version = self
+            .db()
+            .cf(StateSyncRewindPointCf)?
+            .get(&shard, OPERATION)
+            .optional()?;
+        Ok(version)
+    }
+
+    fn state_sync_rewind_points_get_all(&self) -> Result<Vec<(Shard, Version)>, StorageError> {
+        const OPERATION: &str = "state_sync_rewind_points_get_all";
+        let points = self
+            .db()
+            .cf(StateSyncRewindPointCf)?
+            .iterator(Ordering::Ascending, OPERATION)
+            .collect::<Result<_, _>>()?;
+        Ok(points)
     }
 
     fn state_tree_versions_get_latest_for_shard_group(

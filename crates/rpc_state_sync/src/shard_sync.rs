@@ -7,6 +7,7 @@ use anyhow::anyhow;
 use futures::{Stream, StreamExt};
 use log::*;
 use ootle_network::Network;
+use prost::Message;
 use tari_ootle_common_types::{
     Epoch,
     NumPreshards,
@@ -31,6 +32,10 @@ use tari_validator_node_rpc::STATE_SYNC_MAX_BATCH_SIZE;
 use crate::{error::RpcStateSyncError, stats::StateSyncStats};
 
 const LOG_TARGET: &str = "tari::ootle::rpc_state_sync::shard_sync";
+/// The most a peer may stream, in encoded bytes, for one state version before completing it. A
+/// version is buffered whole and committed at once, so this bounds the memory a peer can hold to a
+/// constant multiple of it: the buffered updates are held decoded, each with its tree change.
+const MAX_BUFFERED_VERSION_BYTES: usize = 256 * 1024 * 1024;
 
 /// Rewinds every shard that a sync committed unverified versions of, so that everything the node reads or builds
 /// on afterwards is verified state.
@@ -83,6 +88,27 @@ impl<'a, TStore: StateStore> ShardSync<'a, TStore> {
             store,
             shard,
             checkpoint_shard_root,
+        }
+    }
+
+    /// The first version to stream on top of `persisted_version`.
+    ///
+    /// The stream is inclusive of it, so it must be the first version not yet persisted. A persisted version must
+    /// never be written a second time: JMT nodes are keyed by (version, nibble_path), so rewriting a version
+    /// overwrites live nodes and records those very keys as stale at that version, and the stale-node GC then
+    /// deletes them from under the current tree. Bootstrapped genesis state is committed at version 0 and is never
+    /// synced - every node bootstraps it - so a freshly bootstrapped node starts at version 1, which is also the
+    /// minimum the peer accepts.
+    pub fn start_state_version(&self, persisted_version: Option<Version>) -> Result<Version, RpcStateSyncError> {
+        match persisted_version {
+            Some(version) => version.checked_add(1).ok_or_else(|| RpcStateSyncError::InvariantError {
+                details: format!(
+                    "{} is persisted at v{version}, the last representable state version, yet differs from the \
+                     checkpoint",
+                    self.shard
+                ),
+            }),
+            None => Ok(1),
         }
     }
 
@@ -144,11 +170,12 @@ impl<'a, TStore: StateStore> ShardSync<'a, TStore> {
         let shard = self.shard;
         let rewind_point = maybe_persisted_state_version.unwrap_or(0);
         let mut has_unverified_state = false;
-        let start_state_version = maybe_persisted_state_version.map_or(1, |v| v + 1);
+        let start_state_version = self.start_state_version(maybe_persisted_state_version)?;
         let mut last_state_version = start_state_version;
         let mut tree_changes = vec![];
         let mut updates = vec![];
         let mut expected_state_version = None;
+        let mut buffered = VersionBuffer::default();
 
         // syncing states
         while let Some(result) = state_stream.next().await {
@@ -249,6 +276,7 @@ impl<'a, TStore: StateStore> ShardSync<'a, TStore> {
             }
 
             last_state_version = state_version;
+            buffered.charge(state_version, batch.encoded_len())?;
 
             stats.total_transitions += batch.updates.len() as u64;
 
@@ -288,13 +316,12 @@ impl<'a, TStore: StateStore> ShardSync<'a, TStore> {
                     "🛜 Received more state updates for v{}. Continuing to buffer...",
                     state_version
                 );
-                // Continue buffering
-                // TODO: maximum possible state transitions within a single state version?
                 expected_state_version = Some(state_version);
                 continue;
             }
 
             expected_state_version = None;
+            buffered = VersionBuffer::default();
 
             // Commit the buffered changes for this state version. The shard root is verified once, on
             // the terminal SyncComplete, against the trusted checkpoint. Until then the rewind point
@@ -437,6 +464,25 @@ fn extract_tree_change(network: Network, update: &SubstateUpdateProof, epoch: Ep
     }
 }
 
+/// The encoded bytes buffered for the state version being streamed, held to
+/// [`MAX_BUFFERED_VERSION_BYTES`].
+#[derive(Debug, Default)]
+struct VersionBuffer {
+    bytes: usize,
+}
+
+impl VersionBuffer {
+    fn charge(&mut self, state_version: Version, bytes: usize) -> Result<(), RpcStateSyncError> {
+        self.bytes = self.bytes.saturating_add(bytes);
+        if self.bytes > MAX_BUFFERED_VERSION_BYTES {
+            return Err(RpcStateSyncError::InvalidResponse(anyhow!(
+                "Peer streamed more than {MAX_BUFFERED_VERSION_BYTES} bytes for v{state_version} without completing it"
+            )));
+        }
+        Ok(())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use futures::{FutureExt, stream};
@@ -451,6 +497,20 @@ mod tests {
     use tempfile::TempDir;
 
     use super::*;
+
+    #[test]
+    fn a_version_is_buffered_up_to_the_byte_budget() {
+        let mut buffer = VersionBuffer::default();
+        let chunk = 6 * 1024 * 1024;
+        for _ in 0..MAX_BUFFERED_VERSION_BYTES / chunk {
+            buffer.charge(1, chunk).unwrap();
+        }
+        buffer.charge(1, MAX_BUFFERED_VERSION_BYTES % chunk).unwrap();
+        assert!(matches!(
+            buffer.charge(1, 1),
+            Err(RpcStateSyncError::InvalidResponse(_))
+        ));
+    }
 
     const NETWORK: Network = Network::LocalNet;
     const NUM_PRESHARDS: NumPreshards = NumPreshards::P256;
@@ -696,15 +756,17 @@ mod tests {
         let (store, _tmp) = create_store();
         let verified = vec![(1, vec![create(HONEST)])];
         sync_honestly(&store, &verified).await;
+        let mut checkpoint = verified.clone();
+        checkpoint.push((2, vec![create(2)]));
 
-        let err = sync(&store, &verified, vec![batch(2, vec![create_with_value(
+        let err = sync(&store, &checkpoint, vec![batch(2, vec![create_with_value(
             HONEST, POISON,
         )])])
         .await
         .unwrap_err();
         assert!(matches!(err, RpcStateSyncError::InvalidResponse(_)), "{err}");
 
-        let err = sync(&store, &verified, vec![batch(2, vec![
+        let err = sync(&store, &checkpoint, vec![batch(2, vec![
             destroy(HONEST),
             destroy(HONEST),
         ])])
@@ -716,6 +778,18 @@ mod tests {
         assert!(record.is_up());
         assert_eq!(*record.state_hash(), Hash32::from_array([HONEST; 32]));
         assert_eq!(local_version(&store), Some(1));
+    }
+
+    #[test]
+    fn the_last_representable_version_has_no_successor() {
+        let (store, _tmp) = create_store();
+        let sync = ShardSync::new(NETWORK, NUM_PRESHARDS, &store, shard(), SPARSE_MERKLE_PLACEHOLDER_HASH);
+        assert_eq!(sync.start_state_version(None).unwrap(), 1);
+        assert_eq!(sync.start_state_version(Some(41)).unwrap(), 42);
+        assert!(matches!(
+            sync.start_state_version(Some(Version::MAX)),
+            Err(RpcStateSyncError::InvariantError { .. })
+        ));
     }
 
     #[tokio::test]
